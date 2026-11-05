@@ -231,6 +231,18 @@ pub struct Target {
     handle: TargetHandle,
 }
 
+struct SessionGuard {
+    handle: TargetHandle,
+    closed: CancellationToken,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.closed.cancel();
+        self.handle.set(None);
+    }
+}
+
 fn is_fatal(code: ErrorCode) -> bool {
     matches!(
         code,
@@ -300,6 +312,10 @@ impl Target {
         let link = open_link(&config.url, config.token.as_deref(), &config.name).await?;
         let mut stream = link.stream;
         let closed = CancellationToken::new();
+        let _session = SessionGuard {
+            handle: self.handle.clone(),
+            closed: closed.clone(),
+        };
         let out = spawn_writer(link.sink, closed.clone());
         out.send(Frame::Register {
             target: config.name.clone(),
@@ -376,7 +392,6 @@ impl Target {
             }
         }
         handlers.shutdown().await;
-        self.handle.set(None);
         if registered {
             Ok(())
         } else {

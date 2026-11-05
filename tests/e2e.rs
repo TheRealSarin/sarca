@@ -590,3 +590,42 @@ async fn failed_write_disconnects_the_client_and_fails_pending_requests() {
     ));
     server.stop().await;
 }
+
+#[tokio::test]
+async fn aborted_target_closes_its_connection_and_handle() {
+    let server = start(Config::default(), false).await;
+    let target = Target::new(TargetConfig::new(&server.tcp, "worker", echo_actions()));
+    let handle = target.handle();
+    let running = tokio::spawn(target.run(echo));
+    tokio::time::timeout(WAIT, async {
+        while !handle.is_connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("target never registered");
+
+    running.abort();
+    let _ = running.await;
+    assert!(!handle.is_connected());
+    assert!(matches!(
+        handle.emit("status", Vec::new()).await,
+        Err(ClientError::Disconnected)
+    ));
+
+    let client = Client::connect(&server.tcp, None).await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        while client
+            .targets()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.name == "worker" && t.online)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted target is still registered as online");
+    server.stop().await;
+}

@@ -229,7 +229,9 @@ only on fatal refusals (bad token, forbidden name, invalid registration). A
 `TargetConfig::rules` holds `LocalRule`s triggered by `Every(duration)`,
 `Connected` or `Disconnected`; they call the same handler with a local `Call`
 (`call.is_local()`), whether or not the bus is reachable. `target.handle()`
-returns a `TargetHandle` for `emit`.
+returns a `TargetHandle` for `emit`. Dropping or aborting the `run` future
+closes its connection, so the bus marks the target offline and the handle
+reports disconnected.
 
 `TargetConfig::max_concurrent` (default 64) bounds handlers running at once.
 Deliveries beyond it are answered immediately with a retryable `overloaded`
