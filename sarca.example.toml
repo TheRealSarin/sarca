@@ -1,0 +1,36 @@
+log_messages = true
+
+[server]
+tcp = "127.0.0.1:7878"
+ws = "127.0.0.1:7879"
+unix = "/run/sarca/sarca.sock"
+unix_mode = 0o660
+
+[limits]
+max_frame_bytes = 16777216
+max_queue_per_target = 1000
+default_ttl_ms = 30000
+max_ttl_ms = 3600000
+max_attempts = 10
+max_backoff_ms = 60000
+handshake_timeout_ms = 5000
+session_buffer = 1024
+
+[rate_limit]
+per_second = 100
+burst = 200
+
+[[auth.tokens]]
+name = "operator"
+sha256 = "replace-with-output-of-sarca-hash-token-0000000000000000000000000"
+caps = ["game.*"]
+send = ["*"]
+
+[[auth.tokens]]
+name = "game-servers"
+sha256 = "replace-with-output-of-sarca-hash-token-1111111111111111111111111"
+register = ["game-*"]
+
+[[rules]]
+when_down = "game-1"
+route_to = ["game-2", "group:games"]

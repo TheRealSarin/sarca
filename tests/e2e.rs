@@ -338,3 +338,24 @@ async fn connected_rule_fires_after_registration() {
     target.abort();
     server.stop().await;
 }
+
+#[test]
+fn example_config_is_valid_once_hashes_are_filled_in() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/sarca.example.toml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let filled = text
+        .replace(
+            "replace-with-output-of-sarca-hash-token-0000000000000000000000000",
+            &hash_token("a"),
+        )
+        .replace(
+            "replace-with-output-of-sarca-hash-token-1111111111111111111111111",
+            &hash_token("b"),
+        );
+    let config: Config = toml::from_str(&filled).unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.auth.tokens.len(), 2);
+
+    let unfilled: Config = toml::from_str(&text).unwrap();
+    assert!(unfilled.validate().is_err());
+}
