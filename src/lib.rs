@@ -1,7 +1,9 @@
 pub mod auth;
 pub mod bus;
+pub mod client;
 pub mod config;
 pub mod hooks;
 pub mod server;
+pub mod target;
 pub mod transport;
 pub mod wire;
