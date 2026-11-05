@@ -951,3 +951,25 @@ async fn kicked_session_signals_its_connection_to_close() {
     assert!(peer.rx.recv().await.is_none());
     assert!(peer.rx.is_closed());
 }
+
+#[tokio::test(start_paused = true)]
+async fn sessions_are_capped_per_principal() {
+    let mut config = Config::default();
+    config.limits.max_sessions_per_principal = 1;
+    let bus = start(config);
+    let first = Peer::connect(&bus, anyone()).await;
+    let (_, mut refused) = bus.connect(anyone()).await.unwrap();
+    assert!(matches!(
+        refused.recv().await,
+        Some(Frame::Error {
+            code: ErrorCode::QuotaExceeded,
+            ..
+        })
+    ));
+    assert!(refused.recv().await.is_none());
+    assert!(refused.is_closed());
+
+    let _other = Peer::connect(&bus, principal("other", Grant::everything())).await;
+    first.disconnect().await;
+    let _again = Peer::connect(&bus, anyone()).await;
+}

@@ -79,6 +79,12 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
     that would exceed either (a slow reader, typically) is closed, the same as
     when its `session_buffer` frame slots run out. The per-session budget must
     be at least `max_frame_bytes`.
+  - `max_connections`: connections served at once across all listeners,
+    including ones still handshaking. Further connections wait in the
+    listen backlog until a slot frees up.
+  - `max_sessions_per_principal`: authenticated sessions per principal.
+    Extra sessions are refused with `quota_exceeded`. All anonymous clients
+    share one principal.
   - `offline_target_retention_ms`: how long an offline target's actions and
     groups are kept before it is forgotten (default one hour). Messages for a
     forgotten name still queue.

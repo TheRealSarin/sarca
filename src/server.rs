@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -34,6 +35,7 @@ struct Shared {
     bus: BusHandle,
     auth: Authenticator,
     limits: Limits,
+    connections: Arc<Semaphore>,
 }
 
 pub struct Server {
@@ -92,6 +94,7 @@ impl Server {
             bus: bus::spawn(config, hooks),
             auth: Authenticator::new(&config.auth),
             limits: config.limits.clone(),
+            connections: Arc::new(Semaphore::new(config.limits.max_connections)),
         });
         Ok(Self {
             tcp,
@@ -155,10 +158,14 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, websocket: bool)
                 continue;
             }
         };
+        let Ok(permit) = shared.connections.clone().acquire_owned().await else {
+            return;
+        };
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         while sessions.try_join_next().is_some() {}
         sessions.spawn(async move {
+            let _permit = permit;
             let peer = peer.to_string();
             if !websocket {
                 let (sink, stream) = framed_io(stream, shared.limits.max_frame_bytes);
@@ -190,14 +197,16 @@ async fn accept_unix(listener: UnixListener, shared: Arc<Shared>) {
                 continue;
             }
         };
+        let Ok(permit) = shared.connections.clone().acquire_owned().await else {
+            return;
+        };
         let (sink, stream) = framed_io(stream, shared.limits.max_frame_bytes);
         while sessions.try_join_next().is_some() {}
-        sessions.spawn(run_session(
-            shared.clone(),
-            sink,
-            stream,
-            "unix".to_string(),
-        ));
+        let shared = shared.clone();
+        sessions.spawn(async move {
+            let _permit = permit;
+            run_session(shared, sink, stream, "unix".to_string()).await;
+        });
     }
 }
 

@@ -2,11 +2,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use sarca::auth::hash_token;
 use sarca::client::{Client, ClientError, SendOptions};
 use sarca::config::{AuthConfig, Config, Grant, TokenConfig};
 use sarca::server::Server;
 use sarca::target::{Call, LocalRule, Target, TargetConfig, Trigger};
+use sarca::transport::{DEFAULT_MAX_FRAME_BYTES, Endpoint};
+use sarca::wire::Frame;
 use sarca::wire::{ActionSpec, ErrorCode};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -463,4 +466,81 @@ async fn stalled_stream_does_not_block_other_replies() {
 
     target.abort();
     server.stop().await;
+}
+
+#[tokio::test]
+async fn stalled_reader_is_disconnected_and_frees_its_connection_slot() {
+    let mut config = Config::default();
+    config.limits.max_connections = 2;
+    config.limits.max_outbound_bytes_per_session = 4 * 1024 * 1024;
+    config.limits.handshake_timeout_ms = 200;
+    let server = start(config, false).await;
+
+    let target = Target::new(TargetConfig::new(&server.tcp, "source", echo_actions()));
+    let handle = target.handle();
+    let target = tokio::spawn(target.run(echo));
+    tokio::time::timeout(WAIT, async {
+        while !handle.is_connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("target never registered");
+
+    let (mut sink, mut stream) = Endpoint::parse(&server.tcp)
+        .unwrap()
+        .connect(DEFAULT_MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    sink.send(Frame::Hello {
+        client: "stalled".into(),
+        token: None,
+    })
+    .await
+    .unwrap();
+    let next = tokio::time::timeout(WAIT, stream.next()).await;
+    assert!(matches!(next, Ok(Some(Ok(Frame::Welcome { .. })))));
+    sink.send(Frame::Subscribe {
+        id: 1,
+        target: "source".into(),
+        event: "*".into(),
+    })
+    .await
+    .unwrap();
+    let next = tokio::time::timeout(WAIT, stream.next()).await;
+    assert!(matches!(next, Ok(Some(Ok(Frame::Accepted { id: 1 })))));
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(300),
+        Client::connect(&server.tcp, None),
+    )
+    .await;
+    assert!(blocked.is_err(), "connection limit was not enforced");
+
+    tokio::time::timeout(WAIT, async {
+        for _ in 0..32 {
+            handle.emit("blob", vec![0; 1024 * 1024]).await.unwrap();
+        }
+    })
+    .await
+    .expect("emits blocked");
+
+    let client = tokio::time::timeout(WAIT, Client::connect(&server.tcp, None))
+        .await
+        .expect("stalled connection still holds its slot")
+        .unwrap();
+    let reply = tokio::time::timeout(
+        WAIT,
+        client.request("source", "echo", b"alive".to_vec(), &SendOptions::default()),
+    )
+    .await
+    .expect("request blocked")
+    .unwrap();
+    assert_eq!(reply, b"alive");
+
+    drop((sink, stream));
+    target.abort();
+    tokio::time::timeout(WAIT, server.stop())
+        .await
+        .expect("server did not stop");
 }

@@ -159,6 +159,7 @@ struct Usage {
     subs: usize,
     targets: usize,
     target_bytes: usize,
+    sessions: usize,
 }
 
 impl TargetEntry {
@@ -274,22 +275,7 @@ impl Bus {
                 session,
                 principal,
                 out,
-            } => {
-                let owner: Arc<str> = Arc::from(principal.name.as_str());
-                self.sessions.insert(
-                    session,
-                    Session {
-                        principal,
-                        owner,
-                        out,
-                        target: None,
-                        inflight: HashSet::new(),
-                        owned: HashSet::new(),
-                        subs: HashSet::new(),
-                    },
-                );
-                self.send_to(session, Frame::Welcome { session });
-            }
+            } => self.on_connect(session, principal, out),
             BusEvent::Disconnect { session } => self.drop_session(session),
             BusEvent::Frame { session, frame } => {
                 if self.sessions.contains_key(&session) {
@@ -297,6 +283,35 @@ impl Bus {
                 }
             }
         }
+    }
+
+    fn on_connect(&mut self, session: SessionId, principal: Principal, out: OutboundSender) {
+        let owner: Arc<str> = Arc::from(principal.name.as_str());
+        let open = self.usage_of(&owner).map_or(0, |usage| usage.sessions);
+        if open >= self.limits.max_sessions_per_principal {
+            tracing::warn!(session, principal = %owner, "session quota exceeded, refusing session");
+            let frame = Frame::Error {
+                code: ErrorCode::QuotaExceeded,
+                message: "too many sessions for this principal".into(),
+            };
+            let _ = out.offer(footprint::frame_bytes(&frame), move || frame);
+            out.close();
+            return;
+        }
+        self.usage.entry(owner.clone()).or_default().sessions += 1;
+        self.sessions.insert(
+            session,
+            Session {
+                principal,
+                owner,
+                out,
+                target: None,
+                inflight: HashSet::new(),
+                owned: HashSet::new(),
+                subs: HashSet::new(),
+            },
+        );
+        self.send_to(session, Frame::Welcome { session });
     }
 
     fn on_frame(&mut self, session: SessionId, frame: Frame) {
@@ -1162,6 +1177,9 @@ impl Bus {
             return;
         };
         entry.out.close();
+        if let Some(usage) = self.usage.get_mut(&entry.owner) {
+            usage.sessions = usage.sessions.saturating_sub(1);
+        }
         for hook in &self.hooks {
             hook.on_disconnect(session);
         }

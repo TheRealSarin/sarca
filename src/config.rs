@@ -119,6 +119,11 @@ impl Config {
                 "max_outbound_bytes_per_session",
                 limits.max_outbound_bytes_per_session,
             ),
+            ("max_connections", limits.max_connections),
+            (
+                "max_sessions_per_principal",
+                limits.max_sessions_per_principal,
+            ),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return invalid(format!("limits.{name} must be at least 1"));
@@ -129,6 +134,7 @@ impl Config {
             || limits.max_targets_per_principal > limits.max_targets
             || limits.max_target_bytes_per_principal > limits.max_target_bytes
             || limits.max_outbound_bytes_per_session > limits.max_outbound_bytes
+            || limits.max_sessions_per_principal > limits.max_connections
         {
             return invalid(
                 "per-principal and per-session limits must not exceed their totals".into(),
@@ -218,6 +224,8 @@ pub struct Limits {
     pub max_target_bytes_per_principal: usize,
     pub max_outbound_bytes: usize,
     pub max_outbound_bytes_per_session: usize,
+    pub max_connections: usize,
+    pub max_sessions_per_principal: usize,
     pub offline_target_retention_ms: u64,
 }
 
@@ -244,6 +252,8 @@ impl Default for Limits {
             max_target_bytes_per_principal: 32 * 1024 * 1024,
             max_outbound_bytes: 1024 * 1024 * 1024,
             max_outbound_bytes_per_session: 64 * 1024 * 1024,
+            max_connections: 1_024,
+            max_sessions_per_principal: 256,
             offline_target_retention_ms: 3_600_000,
         }
     }
