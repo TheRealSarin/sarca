@@ -38,7 +38,7 @@ impl ByteBudget {
     }
 }
 
-struct Charge {
+pub(crate) struct Charge {
     session: Arc<ByteBudget>,
     global: Arc<ByteBudget>,
     bytes: usize,
@@ -102,6 +102,14 @@ pub struct Outbound {
 }
 
 impl Outbound {
+    pub(crate) async fn recv_charged(&mut self) -> Option<(Frame, Charge)> {
+        self.rx.recv().await
+    }
+
+    pub(crate) fn try_recv_charged(&mut self) -> Option<(Frame, Charge)> {
+        self.rx.try_recv().ok()
+    }
+
     pub async fn recv(&mut self) -> Option<Frame> {
         self.rx.recv().await.map(|(frame, _charge)| frame)
     }
@@ -176,5 +184,25 @@ mod tests {
         assert!(!rx.is_closed());
         sender.close();
         assert!(rx.is_closed());
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[tokio::test]
+    async fn writer_holds_charge_until_send_finishes() {
+        let budget = ByteBudget::new(100);
+        let (sender, mut receiver) = channel(2, 100, budget.clone());
+        sender.offer(100, || Frame::Ping { nonce: 1 }).unwrap();
+        let (frame, charge) = receiver.recv_charged().await.unwrap();
+        assert_eq!(budget.used(), 100);
+        assert_eq!(
+            sender.offer(1, || Frame::Ping { nonce: 2 }),
+            Err(OfferError::BytesFull)
+        );
+        drop(frame);
+        drop(charge);
+        assert_eq!(budget.used(), 0);
     }
 }

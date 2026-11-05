@@ -15,7 +15,7 @@ use crate::auth::Authenticator;
 use crate::bus::{self, BusHandle};
 use crate::config::{Config, Limits};
 use crate::hooks::Hook;
-use crate::transport::{FrameSink, FrameStream, framed_io, framed_ws};
+use crate::transport::{FrameSink, FrameStream, framed_io_server, framed_ws_server};
 use crate::wire::{ErrorCode, Frame};
 
 #[derive(Debug, thiserror::Error)]
@@ -168,7 +168,7 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, websocket: bool)
             let _permit = permit;
             let peer = peer.to_string();
             if !websocket {
-                let (sink, stream) = framed_io(stream, shared.limits.max_frame_bytes);
+                let (sink, stream) = framed_io_server(stream, shared.limits.max_frame_bytes);
                 return run_session(shared, sink, stream, peer).await;
             }
             let ws_config = WebSocketConfig::default()
@@ -177,7 +177,7 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, websocket: bool)
             let handshake = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config));
             match tokio::time::timeout(handshake_timeout(&shared), handshake).await {
                 Ok(Ok(ws)) => {
-                    let (sink, stream) = framed_ws(ws);
+                    let (sink, stream) = framed_ws_server(ws);
                     run_session(shared, sink, stream, peer).await;
                 }
                 Ok(Err(err)) => tracing::debug!(%peer, %err, "websocket handshake failed"),
@@ -200,7 +200,7 @@ async fn accept_unix(listener: UnixListener, shared: Arc<Shared>) {
         let Ok(permit) = shared.connections.clone().acquire_owned().await else {
             return;
         };
-        let (sink, stream) = framed_io(stream, shared.limits.max_frame_bytes);
+        let (sink, stream) = framed_io_server(stream, shared.limits.max_frame_bytes);
         while sessions.try_join_next().is_some() {}
         let shared = shared.clone();
         sessions.spawn(async move {
@@ -246,12 +246,15 @@ async fn run_session(
     tracing::info!(session, %peer, %client, principal = %principal_name, "session opened");
 
     let closed_by_bus = outbound.closed();
+    let mut active_charge = None;
     let kicked = {
         let writer = async {
-            while let Some(frame) = outbound.recv().await {
+            while let Some((frame, charge)) = outbound.recv_charged().await {
+                active_charge = Some(charge);
                 if sink.send(frame).await.is_err() {
                     return;
                 }
+                active_charge.take();
             }
             let _ = sink.close().await;
         };
@@ -278,7 +281,12 @@ async fn run_session(
     };
     if kicked {
         let flush = async {
-            while let Some(frame) = outbound.try_recv() {
+            // A cancelled send may have left encoded bytes in the sink.
+            if sink.flush().await.is_err() {
+                return;
+            }
+            active_charge.take();
+            while let Some((frame, _charge)) = outbound.try_recv_charged() {
                 if sink.send(frame).await.is_err() {
                     return;
                 }
@@ -287,6 +295,8 @@ async fn run_session(
         };
         let _ = tokio::time::timeout(handshake_timeout(&shared), flush).await;
     }
+    drop(sink);
+    drop(active_charge);
     drop(outbound);
     shared.bus.disconnect(session).await;
     tracing::info!(session, "session closed");

@@ -34,6 +34,20 @@ pub fn framed_io<S>(io: S, max_frame_bytes: usize) -> (FrameSink, FrameStream)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
+    framed_io_mode(io, max_frame_bytes, false)
+}
+
+pub(crate) fn framed_io_server<S>(io: S, max_frame_bytes: usize) -> (FrameSink, FrameStream)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    framed_io_mode(io, max_frame_bytes, true)
+}
+
+fn framed_io_mode<S>(io: S, max_frame_bytes: usize, mut handshake: bool) -> (FrameSink, FrameStream)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(max_frame_bytes)
         .new_codec();
@@ -47,11 +61,30 @@ where
                     .map_err(TransportError::from),
             )
         });
-    let stream = stream.map(|item| Ok(wire::decode(&item?)?));
+    let stream = stream.map(move |item| {
+        let bytes = item?;
+        let frame = decode_incoming(&bytes, handshake)?;
+        handshake = false;
+        Ok(frame)
+    });
     (Box::pin(sink), Box::pin(stream))
 }
 
 pub fn framed_ws<S>(ws: WebSocketStream<S>) -> (FrameSink, FrameStream)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    framed_ws_mode(ws, false)
+}
+
+pub(crate) fn framed_ws_server<S>(ws: WebSocketStream<S>) -> (FrameSink, FrameStream)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    framed_ws_mode(ws, true)
+}
+
+fn framed_ws_mode<S>(ws: WebSocketStream<S>, mut handshake: bool) -> (FrameSink, FrameStream)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -67,10 +100,14 @@ where
         });
     let stream = stream
         .take_while(|msg| future::ready(!matches!(msg, Ok(Message::Close(_)))))
-        .filter_map(|msg| {
+        .filter_map(move |msg| {
             future::ready(match msg {
                 Ok(Message::Binary(data)) => {
-                    Some(wire::decode(&data).map_err(TransportError::from))
+                    let result = decode_incoming(&data, handshake);
+                    if result.is_ok() {
+                        handshake = false;
+                    }
+                    Some(result)
                 }
                 Ok(Message::Text(_)) => Some(Err(TransportError::TextMessage)),
                 Ok(_) => None,
@@ -78,6 +115,21 @@ where
             })
         });
     (Box::pin(sink), Box::pin(stream))
+}
+
+fn decode_incoming(bytes: &[u8], handshake: bool) -> Result<Frame, TransportError> {
+    if handshake && bytes.len() > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hello exceeds 4096 bytes",
+        )
+        .into());
+    }
+    let frame = wire::decode(bytes)?;
+    if handshake && !matches!(frame, Frame::Hello { .. }) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "expected hello").into());
+    }
+    Ok(frame)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,5 +233,27 @@ mod tests {
         .await
         .unwrap();
         assert!(b_rx.next().await.unwrap().is_err());
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    #[test]
+    fn handshake_rejects_non_hello_and_large_hello() {
+        assert!(decode_incoming(&wire::encode(&Frame::Ping { nonce: 1 }).unwrap(), true).is_err());
+        let hello = Frame::Hello {
+            client: "x".repeat(4096),
+            token: None,
+        };
+        assert!(decode_incoming(&wire::encode(&hello).unwrap(), true).is_err());
+        let hello = Frame::Hello {
+            client: "client".into(),
+            token: None,
+        };
+        assert_eq!(
+            decode_incoming(&wire::encode(&hello).unwrap(), true).unwrap(),
+            hello
+        );
     }
 }

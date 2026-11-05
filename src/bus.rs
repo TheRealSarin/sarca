@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
 use crate::auth::Principal;
@@ -33,6 +33,7 @@ enum BusEvent {
     Frame {
         session: SessionId,
         frame: Frame,
+        _charge: OwnedSemaphorePermit,
     },
     Disconnect {
         session: SessionId,
@@ -46,10 +47,11 @@ pub struct BusHandle {
     session_buffer: usize,
     outbound_session_bytes: usize,
     outbound_bytes: Arc<ByteBudget>,
+    ingress: Arc<Semaphore>,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("bus has shut down")]
+#[error("bus unavailable or ingress byte limit exceeded")]
 pub struct BusClosed;
 
 impl BusHandle {
@@ -72,8 +74,18 @@ impl BusHandle {
     }
 
     pub async fn frame(&self, session: SessionId, frame: Frame) -> Result<(), BusClosed> {
+        let bytes = u32::try_from(footprint::frame_bytes(&frame)).map_err(|_| BusClosed)?;
+        let charge = self
+            .ingress
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| BusClosed)?;
         self.tx
-            .send(BusEvent::Frame { session, frame })
+            .send(BusEvent::Frame {
+                session,
+                frame,
+                _charge: charge,
+            })
             .await
             .map_err(|_| BusClosed)
     }
@@ -124,6 +136,7 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
         session_buffer: config.limits.session_buffer.max(1),
         outbound_session_bytes: config.limits.max_outbound_bytes_per_session,
         outbound_bytes: ByteBudget::new(config.limits.max_outbound_bytes),
+        ingress: Arc::new(Semaphore::new(config.limits.max_pending_bytes)),
     }
 }
 
@@ -277,7 +290,11 @@ impl Bus {
                 out,
             } => self.on_connect(session, principal, out),
             BusEvent::Disconnect { session } => self.drop_session(session),
-            BusEvent::Frame { session, frame } => {
+            BusEvent::Frame {
+                session,
+                frame,
+                _charge,
+            } => {
                 if self.sessions.contains_key(&session) {
                     self.on_frame(session, frame);
                 }
@@ -1156,20 +1173,52 @@ impl Bus {
         let Some(entry) = self.sessions.get(&session) else {
             return;
         };
-        let mut targets: Vec<TargetInfo> = self
-            .targets
-            .iter()
-            .filter(|(name, _)| entry.principal.may_address(name))
-            .map(|(name, target)| TargetInfo {
+        // Check a conservative wire/memory bound before cloning registry metadata.
+        let limit = self
+            .limits
+            .max_frame_bytes
+            .min(self.limits.max_outbound_bytes_per_session);
+        let mut estimated = 128usize;
+        let mut targets = Vec::new();
+        for (name, target) in &self.targets {
+            if !entry.principal.may_address(name) {
+                continue;
+            }
+            estimated = estimated.saturating_add(target.bytes.saturating_mul(2));
+            if estimated > limit {
+                return self.reply_fail(
+                    session,
+                    id,
+                    (
+                        ErrorCode::Overloaded,
+                        "target listing exceeds response limit; narrow the principal's send grant"
+                            .into(),
+                    ),
+                );
+            }
+            targets.push(TargetInfo {
                 name: name.clone(),
                 actions: target.actions.clone(),
                 groups: target.groups.clone(),
                 online: target.session.is_some(),
                 queued: self.queues.get(name).map_or(0, VecDeque::len),
-            })
-            .collect();
+            });
+        }
         targets.sort_by(|a, b| a.name.cmp(&b.name));
-        self.send_to(session, Frame::Targets { id, targets });
+        let frame = Frame::Targets { id, targets };
+        let fits = crate::wire::encode(&frame)
+            .is_ok_and(|bytes| bytes.len() <= limit && crate::wire::validate_shape(&bytes).is_ok());
+        if !fits {
+            return self.reply_fail(
+                session,
+                id,
+                (
+                    ErrorCode::Overloaded,
+                    "target listing exceeds response limit".into(),
+                ),
+            );
+        }
+        self.send_to(session, frame);
     }
 
     fn drop_session(&mut self, session: SessionId) {
@@ -1217,5 +1266,27 @@ impl Bus {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+    #[tokio::test]
+    async fn queued_frames_hold_and_release_ingress_budget() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let bytes = footprint::frame_bytes(&Frame::Ping { nonce: 0 });
+        let handle = BusHandle {
+            tx,
+            next_session: Arc::new(AtomicU64::new(1)),
+            session_buffer: 1,
+            outbound_session_bytes: 1024,
+            outbound_bytes: ByteBudget::new(1024),
+            ingress: Arc::new(Semaphore::new(bytes)),
+        };
+        handle.frame(1, Frame::Ping { nonce: 0 }).await.unwrap();
+        assert!(handle.frame(1, Frame::Ping { nonce: 1 }).await.is_err());
+        drop(rx.recv().await.unwrap());
+        handle.frame(1, Frame::Ping { nonce: 2 }).await.unwrap();
     }
 }

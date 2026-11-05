@@ -973,3 +973,20 @@ async fn sessions_are_capped_per_principal() {
     first.disconnect().await;
     let _again = Peer::connect(&bus, anyone()).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn oversized_listing_returns_error_without_disconnecting() {
+    let mut config = Config::default();
+    config.limits.max_frame_bytes = 1024;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    let actions = (0..10)
+        .map(|i| ActionSpec::new(format!("action-{i}-{}", "a".repeat(100))))
+        .collect();
+    target.register_specs("t", actions, &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    caller.send(Frame::ListTargets { id: 1 }).await;
+    assert_eq!(expect_fail(&mut caller).await, (1, ErrorCode::Overloaded));
+    caller.send(Frame::Ping { nonce: 42 }).await;
+    assert_eq!(caller.recv().await, Frame::Pong { nonce: 42 });
+}

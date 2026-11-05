@@ -222,7 +222,98 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, WireError> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
+    validate_shape(bytes)?;
     Ok(rmp_serde::from_slice(bytes)?)
+}
+
+pub(crate) fn validate_shape(bytes: &[u8]) -> Result<(), WireError> {
+    // Inspect the structure without allocating Serde's internally tagged content tree.
+    let mut nodes = 65_536usize;
+    let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes);
+    serde::de::DeserializeSeed::deserialize(
+        Shape {
+            nodes: &mut nodes,
+            depth: 0,
+        },
+        &mut decoder,
+    )?;
+    Ok(())
+}
+
+struct Shape<'a> {
+    nodes: &'a mut usize,
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Shape<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<(), D::Error> {
+        if *self.nodes == 0 || self.depth > 32 {
+            return Err(serde::de::Error::custom("frame structure exceeds limits"));
+        }
+        *self.nodes -= 1;
+        de.deserialize_any(self)
+    }
+}
+
+macro_rules! scalar {
+    ($($method:ident: $ty:ty),*) => {$(
+        fn $method<E: serde::de::Error>(self, _: $ty) -> Result<(), E> { Ok(()) }
+    )*};
+}
+
+impl<'de> serde::de::Visitor<'de> for Shape<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a bounded MessagePack frame")
+    }
+    scalar!(visit_bool: bool, visit_i64: i64, visit_u64: u64, visit_f64: f64,
+        visit_str: &str, visit_bytes: &[u8]);
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if seq.size_hint().is_some_and(|n| n > 1024) {
+            return Err(serde::de::Error::custom("array exceeds 1024 entries"));
+        }
+        let mut count = 0;
+        while seq
+            .next_element_seed(Shape {
+                nodes: self.nodes,
+                depth: self.depth + 1,
+            })?
+            .is_some()
+        {
+            count += 1;
+            if count > 1024 {
+                return Err(serde::de::Error::custom("array exceeds 1024 entries"));
+            }
+        }
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        if map.size_hint().is_some_and(|n| n > 64) {
+            return Err(serde::de::Error::custom("map exceeds 64 entries"));
+        }
+        let mut count = 0;
+        while map
+            .next_key_seed(Shape {
+                nodes: self.nodes,
+                depth: self.depth + 1,
+            })?
+            .is_some()
+        {
+            count += 1;
+            if count > 64 {
+                return Err(serde::de::Error::custom("map exceeds 64 entries"));
+            }
+            map.next_value_seed(Shape {
+                nodes: self.nodes,
+                depth: self.depth + 1,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -384,5 +475,35 @@ mod tests {
         assert!(!valid_name(""));
         assert!(!valid_name("has space"));
         assert!(!valid_name(&"x".repeat(MAX_NAME_LEN + 1)));
+    }
+}
+
+#[cfg(test)]
+mod bounded_decode_tests {
+    use super::*;
+    #[test]
+    fn oversized_array_is_rejected_from_header_alone() {
+        // array32 announcing a billion elements, with no body.
+        let err = decode(&[0xdd, 0x3b, 0x9a, 0xca, 0x00]).unwrap_err();
+        assert!(err.to_string().contains("1024"));
+    }
+    #[test]
+    fn binary_payload_is_not_treated_as_an_array() {
+        let frame = Frame::Reply {
+            id: 1,
+            payload: vec![1; 100_000],
+        };
+        assert_eq!(decode(&encode(&frame).unwrap()).unwrap(), frame);
+    }
+    #[test]
+    fn deep_unknown_fields_are_rejected() {
+        let mut bytes = vec![0x91; 40];
+        bytes.push(0xc0);
+        assert!(
+            decode(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("structure")
+        );
     }
 }

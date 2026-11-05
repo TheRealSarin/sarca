@@ -257,6 +257,13 @@ impl Client {
         waiter: Waiter,
         frame: impl FnOnce(u64) -> Frame,
     ) -> Result<(), ClientError> {
+        // Reserve first: cancellation while waiting must not leave an orphan waiter.
+        let permit = self
+            .inner
+            .out
+            .reserve()
+            .await
+            .map_err(|_| ClientError::Disconnected)?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         {
             let mut state = self.inner.state();
@@ -265,10 +272,7 @@ impl Client {
             }
             state.waiters.insert(id, waiter);
         }
-        if self.inner.out.send(frame(id)).await.is_err() {
-            self.inner.state().waiters.remove(&id);
-            return Err(ClientError::Disconnected);
-        }
+        permit.send(frame(id));
         Ok(())
     }
 }
@@ -388,7 +392,15 @@ async fn read_loop(
     if let Some(inner) = inner.upgrade() {
         let mut state = inner.state();
         state.open = false;
-        state.waiters.clear();
+        for (_, waiter) in state.waiters.drain() {
+            if let Waiter::Stream(tx) = waiter {
+                // Stream items always leave one slot for a terminal error.
+                let _ = tx.try_send(Err(RemoteError {
+                    code: ErrorCode::Unavailable,
+                    message: "connection closed before stream completed".into(),
+                }));
+            }
+        }
     }
 }
 
@@ -405,4 +417,57 @@ fn push_stream_item(tx: &StreamSender, payload: Vec<u8>) -> bool {
 
 fn take(inner: &Inner, id: u64) -> Option<Waiter> {
     inner.state().waiters.remove(&id)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    fn client(out: mpsc::Sender<Frame>) -> Client {
+        Client {
+            inner: Arc::new(Inner {
+                session: 1,
+                out,
+                next_id: AtomicU64::new(1),
+                state: Mutex::new(State {
+                    open: true,
+                    waiters: HashMap::new(),
+                    events: None,
+                }),
+            }),
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_submission_does_not_register_a_waiter() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Frame::Ping { nonce: 0 }).await.unwrap();
+        let client = client(tx);
+        let result = tokio::time::timeout(Duration::from_millis(10), client.targets()).await;
+        assert!(result.is_err());
+        assert!(client.inner.state().waiters.is_empty());
+    }
+    #[tokio::test]
+    async fn disconnect_reports_error_even_with_full_stream_buffer() {
+        let (out, _rx) = mpsc::channel(1);
+        let client = client(out);
+        let (tx, mut rx) = mpsc::channel(STREAM_BUFFER + 1);
+        for _ in 0..STREAM_BUFFER {
+            tx.try_send(Ok(vec![1])).unwrap();
+        }
+        client.inner.state().waiters.insert(1, Waiter::Stream(tx));
+        let (events, _events_rx) = mpsc::channel(1);
+        read_loop(
+            Arc::downgrade(&client.inner),
+            Box::pin(futures_util::stream::empty()),
+            events,
+        )
+        .await;
+        for _ in 0..STREAM_BUFFER {
+            assert!(rx.recv().await.unwrap().is_ok());
+        }
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap_err().code,
+            ErrorCode::Unavailable
+        );
+        assert!(rx.recv().await.is_none());
+    }
 }

@@ -249,3 +249,25 @@ logging. Hooks run on the bus task, so they must be fast and must not block.
 - Keep the config file readable only by the service user; it holds token hashes
   and grants.
 - The unix socket defaults to mode `0600`.
+
+## Resource and failure boundaries
+
+Incoming decoded frames waiting for the bus have a separate aggregate byte
+budget equal to `max_pending_bytes`. A connection exceeding this ingress
+budget is closed rather than allowed to accumulate more frames. Network frame
+buffers remain bounded by `max_frame_bytes` and `max_connections`; the ingress
+budget is not a total process-memory limit.
+
+Outbound reservations remain held through socket writes, including stalled
+writes. An oversized target listing returns `overloaded` without disconnecting
+the caller; narrow its `send` grant to list a smaller set.
+
+Before deserialization allocates collections, frames are checked for at most
+1,024 entries per array, 64 entries per map, 32 levels of nesting, and 65,536
+values overall. Binary payloads are not arrays and retain the configured frame
+size limit. These bounds also apply to unknown fields. The initial hello must
+fit within 4,096 encoded bytes and must be a hello frame.
+
+A stream interrupted by connection loss ends with `unavailable`, including
+when its item buffer is full. Cancellation while waiting to enqueue a request
+does not leave a response waiter behind.
