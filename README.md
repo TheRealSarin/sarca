@@ -303,3 +303,7 @@ does not leave a response waiter behind.
 A failed write, such as a frame over the SDK's 16 MiB limit, closes the whole
 connection: the client's pending requests fail with `Disconnected` and
 `is_connected()` returns false, and a target reconnects.
+
+## Licence
+
+MIT, copyright Florin Sarca. See [LICENSE](LICENSE).
