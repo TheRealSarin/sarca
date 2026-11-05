@@ -1,9 +1,9 @@
 use std::future::Future;
 use std::net::SocketAddr;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -68,9 +68,34 @@ async fn bind_unix(path: &Path, mode: u32) -> Result<UnixListener, ServerError> 
         }
         std::fs::remove_file(path).map_err(bind_error)?;
     }
-    let listener = UnixListener::bind(path).map_err(bind_error)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(bind_error)?;
+    let staging = staging_dir(path);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .map_err(bind_error)?;
+    let staged = staging.join("s");
+    let result = bind_staged(&staged, path, mode);
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    result.map_err(bind_error)
+}
+
+fn bind_staged(staged: &Path, path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+    let listener = UnixListener::bind(staged)?;
+    std::fs::set_permissions(staged, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(staged, path)?;
     Ok(listener)
+}
+
+fn staging_dir(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    parent.join(format!(".sarca{}.{nanos}", std::process::id()))
 }
 
 impl Server {
@@ -236,14 +261,14 @@ async fn run_session(
         _ => return reject(sink, ErrorCode::Protocol, "expected hello").await,
     };
     let Some(principal) = shared.auth.authenticate(token.as_deref()) else {
-        tracing::warn!(%peer, %client, "authentication failed");
+        tracing::warn!(%peer, ?client, "authentication failed");
         return reject(sink, ErrorCode::Unauthorized, "authentication failed").await;
     };
     let principal_name = principal.name.clone();
     let Ok((session, mut outbound)) = shared.bus.connect(principal).await else {
         return reject(sink, ErrorCode::Unavailable, "bus unavailable").await;
     };
-    tracing::info!(session, %peer, %client, principal = %principal_name, "session opened");
+    tracing::info!(session, %peer, ?client, principal = %principal_name, "session opened");
 
     let closed_by_bus = outbound.closed();
     let mut active_charge = None;

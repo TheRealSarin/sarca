@@ -544,3 +544,29 @@ async fn stalled_reader_is_disconnected_and_frees_its_connection_slot() {
         .await
         .expect("server did not stop");
 }
+
+#[tokio::test]
+async fn unix_socket_gets_its_mode_before_it_is_reachable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sarca-mode-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("bus.sock");
+    let mut config = Config::default();
+    config.server.tcp = Some("127.0.0.1:0".into());
+    config.server.unix = Some(socket.clone());
+    config.server.unix_mode = 0o640;
+    let server = Server::bind(&config, vec![]).await.unwrap();
+
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640);
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("bus.sock")]);
+    assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+
+    drop(server);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
