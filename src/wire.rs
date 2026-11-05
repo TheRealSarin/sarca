@@ -267,45 +267,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn encoding_is_a_self_describing_map() {
-        let bytes = encode(&Frame::Ping { nonce: 9 }).unwrap();
-        let value: std::collections::BTreeMap<String, rmpv_like::Value> =
-            rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!(value["type"], rmpv_like::Value::Str("ping".into()));
-        assert_eq!(value["nonce"], rmpv_like::Value::Int(9));
+    #[derive(Serialize, Deserialize)]
+    struct RawSend {
+        #[serde(rename = "type")]
+        kind: String,
+        id: u64,
+        target: String,
+        action: String,
+    }
 
+    #[derive(Deserialize)]
+    struct RawError {
+        #[serde(rename = "type")]
+        kind: String,
+        code: String,
+        message: String,
+    }
+
+    #[test]
+    fn frames_encode_as_maps_with_string_tags() {
         let bytes = encode(&Frame::Error {
             code: ErrorCode::QueueFull,
-            message: "m".into(),
+            message: "full".into(),
         })
         .unwrap();
-        let value: std::collections::BTreeMap<String, rmpv_like::Value> =
-            rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!(value["code"], rmpv_like::Value::Str("queue_full".into()));
+        let raw: RawError = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(raw.kind, "error");
+        assert_eq!(raw.code, "queue_full");
+        assert_eq!(raw.message, "full");
     }
 
     #[test]
     fn optional_envelope_fields_default() {
-        #[derive(Serialize)]
-        struct Minimal<'a> {
-            r#type: &'a str,
-            id: u64,
-            target: &'a str,
-            action: &'a str,
-        }
-        let bytes = rmp_serde::to_vec_named(&Minimal {
-            r#type: "send",
+        let bytes = rmp_serde::to_vec_named(&RawSend {
+            kind: "send".into(),
             id: 1,
-            target: "t",
-            action: "a",
+            target: "t".into(),
+            action: "a".into(),
         })
         .unwrap();
         let Frame::Send(env) = decode(&bytes).unwrap() else {
             panic!("expected send frame");
         };
+        assert_eq!(env.id, 1);
         assert_eq!(env.mode, Mode::Request);
         assert_eq!(env.retry, Retry::default());
+        assert_eq!(env.ttl, 0);
+        assert!(env.caps.is_empty());
         assert!(env.payload.is_empty());
     }
 
@@ -320,16 +328,5 @@ mod tests {
         assert!(!valid_name(""));
         assert!(!valid_name("has space"));
         assert!(!valid_name(&"x".repeat(MAX_NAME_LEN + 1)));
-    }
-
-    mod rmpv_like {
-        use serde::Deserialize;
-
-        #[derive(Debug, PartialEq, Deserialize)]
-        #[serde(untagged)]
-        pub enum Value {
-            Int(u64),
-            Str(String),
-        }
     }
 }

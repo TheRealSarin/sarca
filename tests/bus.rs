@@ -5,6 +5,10 @@ use sarca::bus::{self, BusHandle, SessionId};
 use sarca::config::{AuthConfig, Config, Grant, Rule, TokenConfig};
 use sarca::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode, Retry};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+const RECV_DEADLINE: Duration = Duration::from_secs(3600);
+const SILENCE_WINDOW: Duration = Duration::from_millis(50);
 
 struct Peer {
     bus: BusHandle,
@@ -29,14 +33,14 @@ impl Peer {
     }
 
     async fn recv(&mut self) -> Frame {
-        tokio::time::timeout(Duration::from_secs(600), self.rx.recv())
+        tokio::time::timeout(RECV_DEADLINE, self.rx.recv())
             .await
             .expect("timed out waiting for frame")
             .expect("session closed")
     }
 
     async fn assert_silent(&mut self) {
-        let result = tokio::time::timeout(Duration::from_millis(50), self.rx.recv()).await;
+        let result = tokio::time::timeout(SILENCE_WINDOW, self.rx.recv()).await;
         assert!(result.is_err(), "unexpected frame: {result:?}");
     }
 
@@ -209,13 +213,11 @@ async fn retryable_failures_back_off_then_give_up() {
     };
     caller.send(Frame::Send(env)).await;
 
-    let mut last = tokio::time::Instant::now();
-    let mut gaps = Vec::new();
+    let start = Instant::now();
+    let mut delivered_at = Vec::new();
     for _ in 0..3 {
         let delivered = expect_deliver(&mut target).await;
-        let now = tokio::time::Instant::now();
-        gaps.push((now - last).as_millis());
-        last = now;
+        delivered_at.push(Instant::now() - start);
         target
             .send(Frame::Fail {
                 id: delivered.id,
@@ -225,8 +227,14 @@ async fn retryable_failures_back_off_then_give_up() {
             })
             .await;
     }
-    assert!(gaps[1] >= 1_000 && gaps[1] < 1_100, "{gaps:?}");
-    assert!(gaps[2] >= 2_000 && gaps[2] < 2_100, "{gaps:?}");
+    assert_eq!(
+        delivered_at,
+        [
+            Duration::ZERO,
+            Duration::from_millis(1_000),
+            Duration::from_millis(3_000)
+        ]
+    );
     assert_eq!(expect_fail(&mut caller).await, (3, ErrorCode::TargetFailed));
 }
 
@@ -513,4 +521,47 @@ async fn list_targets_reports_state() {
     assert_eq!(targets.len(), 1);
     assert!(targets[0].online);
     assert_eq!(targets[0].groups, vec!["g"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partially_sent_stream_is_not_retried() {
+    let bus = start(Config::default());
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &["tail"], &[]).await;
+
+    let mut env = envelope(6, "t", "tail", b"");
+    env.mode = Mode::Stream;
+    env.retry = Retry {
+        max_attempts: 5,
+        backoff_ms: 0,
+    };
+    caller.send(Frame::Send(env)).await;
+    let id = expect_deliver(&mut target).await.id;
+    target
+        .send(Frame::StreamItem {
+            id,
+            payload: b"one".to_vec(),
+        })
+        .await;
+    assert!(matches!(
+        caller.recv().await,
+        Frame::StreamItem { id: 6, .. }
+    ));
+    target.disconnect().await;
+    assert_eq!(expect_fail(&mut caller).await, (6, ErrorCode::Unavailable));
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_of_a_disconnected_caller_are_dropped() {
+    let bus = start(Config::default());
+    let caller = Peer::connect(&bus, anyone()).await;
+    caller
+        .send(Frame::Send(envelope(1, "later", "op", b"")))
+        .await;
+    caller.disconnect().await;
+
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("later", &["op"], &[]).await;
+    target.assert_silent().await;
 }

@@ -264,19 +264,33 @@ mod tests {
     }
 
     #[test]
-    fn invalid_configs_are_rejected() {
+    fn semantically_invalid_configs_fail_validation() {
         let cases = [
             "[server]\n",
             "[[auth.tokens]]\nname = \"x\"\nsha256 = \"abc\"\n",
             "[[rules]]\nwhen_down = \"a\"\nroute_to = [\"a\"]\n",
+            "[[rules]]\nwhen_down = \"a\"\nroute_to = []\n",
             "[rate_limit]\nper_second = 0\nburst = 1\n",
+            "[limits]\nmax_attempts = 0\n",
+            "[limits]\ndefault_ttl_ms = 10\nmax_ttl_ms = 5\n",
         ];
         for case in cases {
-            let parsed: Result<Config, _> = toml::from_str(case);
-            if let Ok(config) = parsed {
-                assert!(config.validate().is_err(), "{case}");
-            }
+            let config: Config = toml::from_str(case).unwrap_or_else(|err| panic!("{case}: {err}"));
+            assert!(config.validate().is_err(), "accepted: {case}");
         }
+    }
+
+    #[test]
+    fn unknown_keys_fail_parsing() {
         assert!(toml::from_str::<Config>("bogus = 1").is_err());
+        assert!(toml::from_str::<Config>("[server]\ntpc = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn file_config_without_auth_denies_everyone() {
+        let config: Config = toml::from_str("").unwrap();
+        config.validate().unwrap();
+        assert!(config.auth.anonymous.is_none());
+        assert!(config.auth.tokens.is_empty());
     }
 }
