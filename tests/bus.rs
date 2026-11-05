@@ -810,3 +810,45 @@ async fn rate_limit_covers_non_send_operations() {
     assert_eq!(expect_error(&mut target).await, ErrorCode::RateLimited);
     subscriber.assert_silent().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn fire_and_forget_rejected_before_acceptance_reports_failure() {
+    let mut config = Config::default();
+    config.limits.max_queue_per_target = 1;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target
+        .register_specs(
+            "t",
+            vec![
+                ActionSpec::with_caps("admin", ["root"]),
+                ActionSpec::new("log"),
+            ],
+            &[],
+        )
+        .await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    let fire = |id: u64, target: &str, action: &str| {
+        let mut env = envelope(id, target, action, b"");
+        env.mode = Mode::Fire;
+        Frame::Send(env)
+    };
+
+    caller.send(fire(1, "t", "nope")).await;
+    assert_eq!(
+        expect_fail(&mut caller).await,
+        (1, ErrorCode::UnknownAction)
+    );
+    caller.send(fire(2, "t", "admin")).await;
+    assert_eq!(expect_fail(&mut caller).await, (2, ErrorCode::Forbidden));
+
+    caller.send(fire(3, "offline", "op")).await;
+    assert_eq!(caller.recv().await, Frame::Accepted { id: 3 });
+    caller.send(fire(4, "offline", "op")).await;
+    assert_eq!(expect_fail(&mut caller).await, (4, ErrorCode::QueueFull));
+
+    caller.send(fire(5, "t", "log")).await;
+    assert_eq!(caller.recv().await, Frame::Accepted { id: 5 });
+    expect_deliver(&mut target).await;
+    caller.assert_silent().await;
+}

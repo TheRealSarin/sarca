@@ -175,6 +175,7 @@ struct Pending {
     deadline: Instant,
     expire_key: (Instant, u64),
     streamed: bool,
+    acknowledged: bool,
     stage: Stage,
 }
 
@@ -516,6 +517,7 @@ impl Bus {
                 deadline,
                 expire_key,
                 streamed: false,
+                acknowledged: false,
                 stage: Stage::Waiting,
             },
         );
@@ -525,6 +527,9 @@ impl Bus {
 
         let accepted = self.dispatch(id);
         if mode == Mode::Fire && accepted {
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.acknowledged = true;
+            }
             self.send_to(session, Frame::Accepted { id: caller_id });
         }
     }
@@ -700,7 +705,7 @@ impl Bus {
         let Some(pending) = self.finish(id) else {
             return;
         };
-        if pending.envelope.mode == Mode::Fire {
+        if pending.envelope.mode == Mode::Fire && pending.acknowledged {
             tracing::debug!(id, ?code, %message, "fire-and-forget message dropped");
             return;
         }
