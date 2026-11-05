@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::transport::{DEFAULT_MAX_FRAME_BYTES, Endpoint, FrameSink, FrameStream, TransportError};
 use crate::wire::{Envelope, ErrorCode, Frame, Mode, Retry, TargetInfo};
@@ -88,15 +89,24 @@ pub(crate) async fn open_link(
     }
 }
 
-pub(crate) fn spawn_writer(mut sink: FrameSink) -> mpsc::Sender<Frame> {
+pub(crate) fn spawn_writer(mut sink: FrameSink, closed: CancellationToken) -> mpsc::Sender<Frame> {
     let (tx, mut rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
     tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if sink.send(frame).await.is_err() {
-                return;
+        let _closed = closed.clone().drop_guard();
+        let write = async {
+            while let Some(frame) = rx.recv().await {
+                sink.send(frame).await?;
             }
+            sink.close().await
+        };
+        tokio::select! {
+            result = write => {
+                if let Err(err) = result {
+                    tracing::debug!(%err, "client write failed");
+                }
+            }
+            () = closed.cancelled() => {}
         }
-        let _ = sink.close().await;
     });
     tx
 }
@@ -120,6 +130,7 @@ struct State {
 struct Inner {
     session: u64,
     out: mpsc::Sender<Frame>,
+    closed: CancellationToken,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -149,9 +160,11 @@ impl Client {
     ) -> Result<Self, ClientError> {
         let link = open_link(url, token, client).await?;
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
+        let closed = CancellationToken::new();
         let inner = Arc::new(Inner {
             session: link.session,
-            out: spawn_writer(link.sink),
+            out: spawn_writer(link.sink, closed.clone()),
+            closed: closed.clone(),
             state: Mutex::new(State {
                 open: true,
                 waiters: HashMap::new(),
@@ -159,7 +172,12 @@ impl Client {
             }),
             next_id: AtomicU64::new(1),
         });
-        tokio::spawn(read_loop(Arc::downgrade(&inner), link.stream, events_tx));
+        tokio::spawn(read_loop(
+            Arc::downgrade(&inner),
+            link.stream,
+            events_tx,
+            closed,
+        ));
         Ok(Self { inner })
     }
 
@@ -168,7 +186,7 @@ impl Client {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.inner.state().open
+        !self.inner.closed.is_cancelled()
     }
 
     pub fn events(&self) -> Option<mpsc::Receiver<Event>> {
@@ -300,9 +318,11 @@ fn build_envelope(
 
 async fn read_loop(
     inner: std::sync::Weak<Inner>,
-    mut stream: FrameStream,
+    stream: FrameStream,
     events: mpsc::Sender<Event>,
+    closed: CancellationToken,
 ) {
+    let mut stream = std::pin::pin!(stream.take_until(closed.clone().cancelled_owned()));
     while let Some(item) = stream.next().await {
         let frame = match item {
             Ok(frame) => frame,
@@ -389,6 +409,7 @@ async fn read_loop(
             _ => {}
         }
     }
+    closed.cancel();
     if let Some(inner) = inner.upgrade() {
         let mut state = inner.state();
         state.open = false;
@@ -427,6 +448,7 @@ mod regression_tests {
             inner: Arc::new(Inner {
                 session: 1,
                 out,
+                closed: CancellationToken::new(),
                 next_id: AtomicU64::new(1),
                 state: Mutex::new(State {
                     open: true,
@@ -459,6 +481,7 @@ mod regression_tests {
             Arc::downgrade(&client.inner),
             Box::pin(futures_util::stream::empty()),
             events,
+            client.inner.closed.clone(),
         )
         .await;
         for _ in 0..STREAM_BUFFER {

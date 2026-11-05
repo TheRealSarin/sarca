@@ -570,3 +570,23 @@ async fn unix_socket_gets_its_mode_before_it_is_reachable() {
     drop(server);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn failed_write_disconnects_the_client_and_fails_pending_requests() {
+    let server = start(Config::default(), false).await;
+    let client = Client::connect(&server.tcp, None).await.unwrap();
+    let oversized = vec![0; DEFAULT_MAX_FRAME_BYTES];
+    let result = tokio::time::timeout(
+        WAIT,
+        client.request("t", "op", oversized, &SendOptions::default()),
+    )
+    .await
+    .expect("request hung after its frame could not be written");
+    assert!(matches!(result, Err(ClientError::Disconnected)));
+    assert!(!client.is_connected());
+    assert!(matches!(
+        client.targets().await,
+        Err(ClientError::Disconnected)
+    ));
+    server.stop().await;
+}

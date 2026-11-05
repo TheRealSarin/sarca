@@ -289,3 +289,7 @@ fit within 4,096 encoded bytes and must be a hello frame.
 A stream interrupted by connection loss ends with `unavailable`, including
 when its item buffer is full. Cancellation while waiting to enqueue a request
 does not leave a response waiter behind.
+
+A failed write, such as a frame over the SDK's 16 MiB limit, closes the whole
+connection: the client's pending requests fail with `Disconnected` and
+`is_connected()` returns false, and a target reconnects.

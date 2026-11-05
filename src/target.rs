@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::{ClientError, RemoteError, open_link, spawn_writer};
 use crate::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode};
@@ -298,7 +299,8 @@ impl Target {
         let config = &self.config;
         let link = open_link(&config.url, config.token.as_deref(), &config.name).await?;
         let mut stream = link.stream;
-        let out = spawn_writer(link.sink);
+        let closed = CancellationToken::new();
+        let out = spawn_writer(link.sink, closed.clone());
         out.send(Frame::Register {
             target: config.name.clone(),
             actions: config.actions.clone(),
@@ -317,6 +319,7 @@ impl Target {
                     _ => break,
                 },
                 Some(_) = handlers.join_next(), if !handlers.is_empty() => continue,
+                () = closed.cancelled() => break,
             };
             match frame {
                 Frame::Registered { .. } => {
