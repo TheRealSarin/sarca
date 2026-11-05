@@ -62,6 +62,11 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
 
 - `[server]`: `tcp`, `ws`, `unix` listen addresses (at least one) and `unix_mode`
   (default `0o600`). An existing stale socket file is replaced; a live one is not.
+  `ws_origins` lists the browser origins (`scheme://host[:port]`) allowed to
+  open WebSocket connections; a handshake with any other `Origin` header is
+  refused with HTTP 403. It is empty by default, so web pages cannot reach the
+  bus unless listed. Clients that send no `Origin` header (the SDK and CLI) are
+  not affected.
 - `[limits]`: frame size, per-target queue length, default and maximum TTL,
   maximum retry attempts and backoff, handshake timeout, per-session buffer,
   and resource quotas:
@@ -269,6 +274,9 @@ logging. Hooks run on the bus task, so they must be fast and must not block.
 - Keep the config file readable only by the service user; it holds token hashes
   and grants.
 - The unix socket defaults to mode `0600`.
+- WebSocket handshakes from web pages are refused unless `server.ws_origins`
+  lists their origin, so a site open in a browser that can reach the bus
+  cannot use its anonymous grant.
 
 ## Resource and failure boundaries
 

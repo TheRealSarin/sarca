@@ -74,6 +74,11 @@ impl Config {
                 "at least one of server.tcp, server.ws or server.unix must be set".into(),
             );
         }
+        if let Some(origin) = self.server.ws_origins.iter().find(|o| !valid_origin(o)) {
+            return invalid(format!(
+                "server.ws_origins entry '{origin}' must be scheme://host[:port]"
+            ));
+        }
         if self.limits.max_frame_bytes < 1024 {
             return invalid("limits.max_frame_bytes must be at least 1024".into());
         }
@@ -186,6 +191,8 @@ impl Config {
 pub struct ServerConfig {
     pub tcp: Option<String>,
     pub ws: Option<String>,
+    #[serde(default)]
+    pub ws_origins: Vec<String>,
     pub unix: Option<PathBuf>,
     #[serde(default = "default_unix_mode")]
     pub unix_mode: u32,
@@ -196,6 +203,7 @@ impl Default for ServerConfig {
         Self {
             tcp: Some("127.0.0.1:7878".into()),
             ws: None,
+            ws_origins: Vec::new(),
             unix: None,
             unix_mode: default_unix_mode(),
         }
@@ -204,6 +212,19 @@ impl Default for ServerConfig {
 
 fn default_unix_mode() -> u32 {
     0o600
+}
+
+fn valid_origin(origin: &str) -> bool {
+    origin.split_once("://").is_some_and(|(scheme, authority)| {
+        !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+            && !authority.is_empty()
+            && authority
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b'?' | b'#'))
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -334,6 +355,7 @@ mod tests {
             [server]
             tcp = "0.0.0.0:7878"
             ws = "127.0.0.1:7879"
+            ws_origins = ["https://dash.example", "http://[::1]:8080"]
             unix = "/run/sarca/sarca.sock"
 
             [limits]
@@ -361,6 +383,7 @@ mod tests {
         )
         .unwrap();
         config.validate().unwrap();
+        assert_eq!(config.server.ws_origins.len(), 2);
         assert_eq!(config.limits.max_queue_per_target, 10);
         assert_eq!(config.limits.default_ttl_ms, 30_000);
         assert_eq!(config.auth.tokens[0].grant.caps, vec!["game.admin"]);
@@ -384,6 +407,9 @@ mod tests {
             "[limits]\nmax_outbound_bytes_per_principal = 1024\n",
             "[limits]\nmax_outbound_bytes = 1048576\nmax_outbound_bytes_per_principal = 2097152\nmax_outbound_bytes_per_session = 1048576\nmax_frame_bytes = 1024\n",
             "[limits]\ndefault_ttl_ms = 10\nmax_ttl_ms = 5\n",
+            "[server]\nws = \"127.0.0.1:7879\"\nws_origins = [\"https://dash.example/\"]\n",
+            "[server]\nws = \"127.0.0.1:7879\"\nws_origins = [\"dash.example\"]\n",
+            "[server]\nws = \"127.0.0.1:7879\"\nws_origins = [\"\"]\n",
         ];
         for case in cases {
             let config: Config = toml::from_str(case).unwrap_or_else(|err| panic!("{case}: {err}"));

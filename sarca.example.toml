@@ -3,6 +3,7 @@ log_messages = true
 [server]
 tcp = "127.0.0.1:7878"
 ws = "127.0.0.1:7879"
+ws_origins = []
 unix = "/run/sarca/sarca.sock"
 unix_mode = 0o660
 

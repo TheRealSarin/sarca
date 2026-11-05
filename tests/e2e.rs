@@ -9,7 +9,7 @@ use sarca::config::{AuthConfig, Config, Grant, TokenConfig};
 use sarca::server::Server;
 use sarca::target::{Call, LocalRule, Target, TargetConfig, Trigger};
 use sarca::transport::{DEFAULT_MAX_FRAME_BYTES, Endpoint};
-use sarca::wire::Frame;
+use sarca::wire::{self, Frame};
 use sarca::wire::{ActionSpec, ErrorCode};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -627,5 +627,48 @@ async fn aborted_target_closes_its_connection_and_handle() {
     })
     .await
     .expect("aborted target is still registered as online");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn websocket_handshakes_from_unlisted_origins_are_refused() {
+    use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
+    let mut config = Config::default();
+    config.server.ws_origins = vec!["https://dashboard.example".into()];
+    let server = start(config, false).await;
+    let open = |origin: &str| {
+        let mut request = server.ws.as_str().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
+        tokio_tungstenite::connect_async(request)
+    };
+
+    let refused = open("https://untrusted.example").await;
+    assert!(
+        matches!(&refused, Err(tungstenite::Error::Http(response)) if response.status() == 403),
+        "unexpected handshake result: {refused:?}"
+    );
+
+    let (mut ws, _) = open("https://DASHBOARD.example").await.unwrap();
+    let hello = Frame::Hello {
+        client: "dashboard".into(),
+        token: None,
+    };
+    ws.send(Message::Binary(wire::encode(&hello).unwrap().into()))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(WAIT, ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        wire::decode(&reply.into_data()).unwrap(),
+        Frame::Welcome { .. }
+    ));
+
+    let sdk = Client::connect(&server.ws, None).await.unwrap();
+    assert!(sdk.targets().await.is_ok());
     server.stop().await;
 }

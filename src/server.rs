@@ -9,6 +9,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header::ORIGIN};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::auth::Authenticator;
@@ -36,6 +40,36 @@ struct Shared {
     auth: Authenticator,
     limits: Limits,
     connections: Arc<Semaphore>,
+    ws_origins: Vec<String>,
+}
+
+impl Shared {
+    fn allows_origin(&self, origin: &HeaderValue) -> bool {
+        origin.to_str().is_ok_and(|origin| {
+            self.ws_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+        })
+    }
+}
+
+struct OriginCheck<'a> {
+    shared: &'a Shared,
+    peer: &'a str,
+}
+
+impl Callback for OriginCheck<'_> {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        match request.headers().get(ORIGIN) {
+            Some(origin) if !self.shared.allows_origin(origin) => {
+                tracing::warn!(peer = %self.peer, ?origin, "websocket origin not allowed");
+                let mut refusal = ErrorResponse::new(None);
+                *refusal.status_mut() = StatusCode::FORBIDDEN;
+                Err(refusal)
+            }
+            _ => Ok(response),
+        }
+    }
 }
 
 pub struct Server {
@@ -120,6 +154,7 @@ impl Server {
             auth: Authenticator::new(&config.auth),
             limits: config.limits.clone(),
             connections: Arc::new(Semaphore::new(config.limits.max_connections)),
+            ws_origins: config.server.ws_origins.clone(),
         });
         Ok(Self {
             tcp,
@@ -199,7 +234,15 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, websocket: bool)
             let ws_config = WebSocketConfig::default()
                 .max_message_size(Some(shared.limits.max_frame_bytes))
                 .max_frame_size(Some(shared.limits.max_frame_bytes));
-            let handshake = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config));
+            let origin_check = OriginCheck {
+                shared: &shared,
+                peer: &peer,
+            };
+            let handshake = tokio_tungstenite::accept_hdr_async_with_config(
+                stream,
+                origin_check,
+                Some(ws_config),
+            );
             match tokio::time::timeout(handshake_timeout(&shared), handshake).await {
                 Ok(Ok(ws)) => {
                     let (sink, stream) = framed_ws_server(ws);
