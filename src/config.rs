@@ -114,6 +114,11 @@ impl Config {
                 "max_target_bytes_per_principal",
                 limits.max_target_bytes_per_principal,
             ),
+            ("max_outbound_bytes", limits.max_outbound_bytes),
+            (
+                "max_outbound_bytes_per_session",
+                limits.max_outbound_bytes_per_session,
+            ),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return invalid(format!("limits.{name} must be at least 1"));
@@ -123,9 +128,16 @@ impl Config {
             || limits.max_subscriptions_per_session > limits.max_subscriptions_per_principal
             || limits.max_targets_per_principal > limits.max_targets
             || limits.max_target_bytes_per_principal > limits.max_target_bytes
+            || limits.max_outbound_bytes_per_session > limits.max_outbound_bytes
         {
             return invalid(
                 "per-principal and per-session limits must not exceed their totals".into(),
+            );
+        }
+        if limits.max_outbound_bytes_per_session < limits.max_frame_bytes {
+            return invalid(
+                "limits.max_outbound_bytes_per_session must be at least limits.max_frame_bytes"
+                    .into(),
             );
         }
         for token in &self.auth.tokens {
@@ -204,6 +216,8 @@ pub struct Limits {
     pub max_targets_per_principal: usize,
     pub max_target_bytes: usize,
     pub max_target_bytes_per_principal: usize,
+    pub max_outbound_bytes: usize,
+    pub max_outbound_bytes_per_session: usize,
     pub offline_target_retention_ms: u64,
 }
 
@@ -228,6 +242,8 @@ impl Default for Limits {
             max_targets_per_principal: 1_000,
             max_target_bytes: 256 * 1024 * 1024,
             max_target_bytes_per_principal: 32 * 1024 * 1024,
+            max_outbound_bytes: 1024 * 1024 * 1024,
+            max_outbound_bytes_per_session: 64 * 1024 * 1024,
             offline_target_retention_ms: 3_600_000,
         }
     }
@@ -347,6 +363,7 @@ mod tests {
             "[limits]\nmax_pending = 0\n",
             "[limits]\nmax_targets = 10\nmax_targets_per_principal = 20\n",
             "[limits]\nmax_subscriptions_per_session = 0\n",
+            "[limits]\nmax_frame_bytes = 4096\nmax_outbound_bytes_per_session = 2048\n",
             "[limits]\ndefault_ttl_ms = 10\nmax_ttl_ms = 5\n",
         ];
         for case in cases {

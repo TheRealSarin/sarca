@@ -25,6 +25,8 @@ max_targets = 10000
 max_targets_per_principal = 1000
 max_target_bytes = 268435456
 max_target_bytes_per_principal = 33554432
+max_outbound_bytes = 1073741824
+max_outbound_bytes_per_session = 67108864
 offline_target_retention_ms = 3600000
 
 [rate_limit]

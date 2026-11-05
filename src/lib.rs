@@ -4,6 +4,7 @@ pub mod client;
 pub mod config;
 mod footprint;
 pub mod hooks;
+pub mod outbound;
 pub mod server;
 pub mod target;
 pub mod transport;

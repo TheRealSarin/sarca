@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
 
 use crate::auth::Principal;
 use crate::config::{Config, Limits};
 use crate::footprint;
 use crate::hooks::{Hook, HookContext, LoggingHook, Operation, RateLimitHook};
+use crate::outbound::{self, ByteBudget, OfferError, Outbound, OutboundSender};
 use crate::wire::{
     ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, Mode, TargetInfo, valid_name,
 };
@@ -28,7 +28,7 @@ enum BusEvent {
     Connect {
         session: SessionId,
         principal: Principal,
-        out: mpsc::Sender<Frame>,
+        out: OutboundSender,
     },
     Frame {
         session: SessionId,
@@ -44,6 +44,8 @@ pub struct BusHandle {
     tx: mpsc::Sender<BusEvent>,
     next_session: Arc<AtomicU64>,
     session_buffer: usize,
+    outbound_session_bytes: usize,
+    outbound_bytes: Arc<ByteBudget>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,12 +53,13 @@ pub struct BusHandle {
 pub struct BusClosed;
 
 impl BusHandle {
-    pub async fn connect(
-        &self,
-        principal: Principal,
-    ) -> Result<(SessionId, mpsc::Receiver<Frame>), BusClosed> {
+    pub async fn connect(&self, principal: Principal) -> Result<(SessionId, Outbound), BusClosed> {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
-        let (out, rx) = mpsc::channel(self.session_buffer);
+        let (out, rx) = outbound::channel(
+            self.session_buffer,
+            self.outbound_session_bytes,
+            self.outbound_bytes.clone(),
+        );
         self.tx
             .send(BusEvent::Connect {
                 session,
@@ -119,13 +122,15 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
         tx,
         next_session: Arc::new(AtomicU64::new(1)),
         session_buffer: config.limits.session_buffer.max(1),
+        outbound_session_bytes: config.limits.max_outbound_bytes_per_session,
+        outbound_bytes: ByteBudget::new(config.limits.max_outbound_bytes),
     }
 }
 
 struct Session {
     principal: Principal,
     owner: Arc<str>,
-    out: mpsc::Sender<Frame>,
+    out: OutboundSender,
     target: Option<String>,
     inflight: HashSet<u64>,
     owned: HashSet<u64>,
@@ -333,21 +338,27 @@ impl Bus {
     }
 
     fn send_to(&mut self, session: SessionId, frame: Frame) -> bool {
+        let bytes = footprint::frame_bytes(&frame);
+        self.send_lazy(session, bytes, move || frame)
+    }
+
+    fn send_lazy(
+        &mut self,
+        session: SessionId,
+        bytes: usize,
+        build: impl FnOnce() -> Frame,
+    ) -> bool {
         let Some(entry) = self.sessions.get(&session) else {
             return false;
         };
-        match entry.out.try_send(frame) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                tracing::warn!(session, "session outbound buffer full, closing session");
-                self.kicks.push(session);
-                false
-            }
-            Err(TrySendError::Closed(_)) => {
-                self.kicks.push(session);
-                false
-            }
+        let Err(err) = entry.out.offer(bytes, build) else {
+            return true;
+        };
+        if err != OfferError::Closed {
+            tracing::warn!(session, reason = ?err, "session outbound buffer full, closing session");
         }
+        self.kicks.push(session);
+        false
     }
 
     fn session_error(&mut self, session: SessionId, code: ErrorCode, message: impl Into<String>) {
@@ -1112,15 +1123,14 @@ impl Bus {
                 }
             }
         }
+        let frame = Frame::Event {
+            target: name,
+            event,
+            payload,
+        };
+        let bytes = footprint::frame_bytes(&frame);
         for recipient in recipients {
-            self.send_to(
-                recipient,
-                Frame::Event {
-                    target: name.clone(),
-                    event: event.clone(),
-                    payload: payload.clone(),
-                },
-            );
+            self.send_lazy(recipient, bytes, || frame.clone());
         }
     }
 
@@ -1151,6 +1161,7 @@ impl Bus {
         let Some(entry) = self.sessions.remove(&session) else {
             return;
         };
+        entry.out.close();
         for hook in &self.hooks {
             hook.on_disconnect(session);
         }

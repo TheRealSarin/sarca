@@ -3,8 +3,8 @@ use std::time::Duration;
 use sarca::auth::{Authenticator, Principal, hash_token};
 use sarca::bus::{self, BusHandle, SessionId};
 use sarca::config::{AuthConfig, Config, Grant, RateLimit, Rule, TokenConfig};
+use sarca::outbound::Outbound;
 use sarca::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode, Retry};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 const RECV_DEADLINE: Duration = Duration::from_secs(3600);
@@ -13,7 +13,7 @@ const SILENCE_WINDOW: Duration = Duration::from_millis(50);
 struct Peer {
     bus: BusHandle,
     session: SessionId,
-    rx: mpsc::Receiver<Frame>,
+    rx: Outbound,
 }
 
 impl Peer {
@@ -909,4 +909,45 @@ async fn registration_metadata_is_bounded_by_count_and_bytes() {
     assert_eq!(expect_error(&mut peer).await, ErrorCode::QuotaExceeded);
 
     peer.register("t", &["op"], &[]).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_subscriber_is_closed_once_its_byte_budget_is_spent() {
+    let mut config = Config::default();
+    config.limits.max_outbound_bytes_per_session = 3_000;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &[], &[]).await;
+    let mut slow = Peer::connect(&bus, anyone()).await;
+    slow.send(subscribe(1, "t", "*")).await;
+    for _ in 0..5 {
+        target
+            .send(Frame::Emit {
+                event: "blob".into(),
+                payload: vec![0; 1_000],
+            })
+            .await;
+    }
+    target.send(Frame::Ping { nonce: 1 }).await;
+    assert_eq!(target.recv().await, Frame::Pong { nonce: 1 });
+
+    assert!(slow.rx.is_closed());
+    assert_eq!(slow.recv().await, Frame::Accepted { id: 1 });
+    let mut events = 0;
+    while let Some(frame) = slow.rx.recv().await {
+        assert!(matches!(frame, Frame::Event { .. }));
+        events += 1;
+    }
+    assert!((1..5).contains(&events), "received {events} events");
+}
+
+#[tokio::test(start_paused = true)]
+async fn kicked_session_signals_its_connection_to_close() {
+    let bus = start(Config::default());
+    let mut peer = Peer::connect(&bus, anyone()).await;
+    assert!(!peer.rx.is_closed());
+    peer.send(Frame::Welcome { session: 0 }).await;
+    assert_eq!(expect_error(&mut peer).await, ErrorCode::Protocol);
+    assert!(peer.rx.recv().await.is_none());
+    assert!(peer.rx.is_closed());
 }

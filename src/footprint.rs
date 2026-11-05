@@ -1,6 +1,6 @@
 use std::mem::size_of;
 
-use crate::wire::{ActionSpec, Envelope};
+use crate::wire::{ActionSpec, Envelope, Frame, TargetInfo};
 
 const REGISTRATION_OVERHEAD: usize = 256;
 
@@ -21,6 +21,46 @@ pub(crate) fn actions_bytes(actions: &[ActionSpec]) -> usize {
         .iter()
         .map(|action| size_of::<ActionSpec>() + action.name.len() + string_list_bytes(&action.caps))
         .sum()
+}
+
+pub(crate) fn frame_bytes(frame: &Frame) -> usize {
+    let content = match frame {
+        Frame::Hello { client, token } => client.len() + token.as_ref().map_or(0, String::len),
+        Frame::Register {
+            target,
+            actions,
+            groups,
+        } => target.len() + actions_bytes(actions) + string_list_bytes(groups),
+        Frame::Registered { target } => target.len(),
+        Frame::Send(envelope) | Frame::Deliver(envelope) => envelope_bytes(envelope),
+        Frame::Reply { payload, .. } | Frame::StreamItem { payload, .. } => payload.len(),
+        Frame::Fail { message, .. } | Frame::Error { message, .. } => message.len(),
+        Frame::Subscribe { target, event, .. } | Frame::Unsubscribe { target, event } => {
+            target.len() + event.len()
+        }
+        Frame::Emit { event, payload } => event.len() + payload.len(),
+        Frame::Event {
+            target,
+            event,
+            payload,
+        } => target.len() + event.len() + payload.len(),
+        Frame::Targets { targets, .. } => targets
+            .iter()
+            .map(|info| {
+                size_of::<TargetInfo>()
+                    + info.name.len()
+                    + actions_bytes(&info.actions)
+                    + string_list_bytes(&info.groups)
+            })
+            .sum(),
+        Frame::Welcome { .. }
+        | Frame::Accepted { .. }
+        | Frame::StreamEnd { .. }
+        | Frame::ListTargets { .. }
+        | Frame::Ping { .. }
+        | Frame::Pong { .. } => 0,
+    };
+    size_of::<Frame>() + content
 }
 
 pub(crate) fn registration_bytes(target: &str, actions: &[ActionSpec], groups: &[String]) -> usize {

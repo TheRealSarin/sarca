@@ -74,6 +74,11 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
     offline targets. Re-registering a name you already own is always allowed.
   - `max_target_bytes` / `max_target_bytes_per_principal`: estimated memory
     held by registrations (names, actions, capability lists, groups).
+  - `max_outbound_bytes_per_session` / `max_outbound_bytes`: estimated bytes
+    waiting to be written to one connection, and to all of them. A session
+    that would exceed either (a slow reader, typically) is closed, the same as
+    when its `session_buffer` frame slots run out. The per-session budget must
+    be at least `max_frame_bytes`.
   - `offline_target_retention_ms`: how long an offline target's actions and
     groups are kept before it is forgotten (default one hour). Messages for a
     forgotten name still queue.

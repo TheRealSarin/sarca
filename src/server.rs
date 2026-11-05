@@ -236,33 +236,49 @@ async fn run_session(
     };
     tracing::info!(session, %peer, %client, principal = %principal_name, "session opened");
 
-    let writer = async {
-        while let Some(frame) = outbound.recv().await {
-            if sink.send(frame).await.is_err() {
-                return;
-            }
-        }
-        let _ = sink.close().await;
-    };
-    let reader = async {
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(frame) => {
-                    if shared.bus.frame(session, frame).await.is_err() {
-                        return;
-                    }
-                }
-                Err(err) => {
-                    tracing::debug!(session, %err, "read failed");
+    let closed_by_bus = outbound.closed();
+    let kicked = {
+        let writer = async {
+            while let Some(frame) = outbound.recv().await {
+                if sink.send(frame).await.is_err() {
                     return;
                 }
             }
+            let _ = sink.close().await;
+        };
+        let reader = async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(frame) => {
+                        if shared.bus.frame(session, frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(session, %err, "read failed");
+                        return;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            () = writer => false,
+            () = reader => false,
+            () = closed_by_bus => true,
         }
     };
-    tokio::select! {
-        () = writer => {}
-        () = reader => {}
+    if kicked {
+        let flush = async {
+            while let Some(frame) = outbound.try_recv() {
+                if sink.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            let _ = sink.close().await;
+        };
+        let _ = tokio::time::timeout(handshake_timeout(&shared), flush).await;
     }
+    drop(outbound);
     shared.bus.disconnect(session).await;
     tracing::info!(session, "session closed");
 }
