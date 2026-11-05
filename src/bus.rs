@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::auth::Principal;
 use crate::config::{Config, Limits};
-use crate::hooks::{Hook, HookContext, LoggingHook, RateLimitHook};
+use crate::hooks::{Hook, HookContext, LoggingHook, Operation, RateLimitHook};
 use crate::wire::{
     ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, Mode, TargetInfo, valid_name,
 };
@@ -19,6 +19,8 @@ pub type SessionId = u64;
 const MAX_ACTIONS: usize = 1024;
 const MAX_GROUPS: usize = 64;
 const WILDCARD: &str = "*";
+
+type Failure = (ErrorCode, String);
 
 enum BusEvent {
     Connect {
@@ -101,8 +103,10 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
         queues: HashMap::new(),
         pending: HashMap::new(),
         timers: BTreeMap::new(),
-        group_cursor: HashMap::new(),
+        groups: HashMap::new(),
         subs: HashMap::new(),
+        usage: HashMap::new(),
+        pending_bytes: 0,
         kicks: Vec::new(),
         next_id: 1,
         next_timer: 0,
@@ -117,6 +121,7 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
 
 struct Session {
     principal: Principal,
+    owner: Arc<str>,
     out: mpsc::Sender<Frame>,
     target: Option<String>,
     inflight: HashSet<u64>,
@@ -126,8 +131,24 @@ struct Session {
 
 struct TargetEntry {
     session: Option<SessionId>,
+    owner: Arc<str>,
     actions: Vec<ActionSpec>,
     groups: Vec<String>,
+    forget_key: Option<(Instant, u64)>,
+}
+
+#[derive(Default)]
+struct Group {
+    members: BTreeSet<String>,
+    cursor: usize,
+}
+
+#[derive(Default)]
+struct Usage {
+    pending: usize,
+    pending_bytes: usize,
+    subs: usize,
+    targets: usize,
 }
 
 impl TargetEntry {
@@ -145,6 +166,8 @@ enum Stage {
 
 struct Pending {
     caller: SessionId,
+    owner: Arc<str>,
+    bytes: usize,
     caller_id: u64,
     envelope: Envelope,
     attempts: u32,
@@ -158,6 +181,7 @@ struct Pending {
 enum Timer {
     Expire(u64),
     Retry(u64),
+    Forget(String),
 }
 
 enum Route {
@@ -175,8 +199,10 @@ struct Bus {
     queues: HashMap<String, VecDeque<u64>>,
     pending: HashMap<u64, Pending>,
     timers: BTreeMap<(Instant, u64), Timer>,
-    group_cursor: HashMap<String, usize>,
+    groups: HashMap<String, Group>,
     subs: HashMap<(String, String), HashSet<SessionId>>,
+    usage: HashMap<Arc<str>, Usage>,
+    pending_bytes: usize,
     kicks: Vec<SessionId>,
     next_id: u64,
     next_timer: u64,
@@ -198,6 +224,20 @@ fn valid_route(key: &str) -> bool {
 
 fn valid_pattern(value: &str, check: fn(&str) -> bool) -> bool {
     value == WILDCARD || check(value)
+}
+
+fn retained_bytes(envelope: &Envelope) -> usize {
+    envelope.payload.len()
+        + envelope.target.len()
+        + envelope.action.len()
+        + envelope.caps.iter().map(String::len).sum::<usize>()
+}
+
+fn is_retryable(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::RateLimited | ErrorCode::Overloaded | ErrorCode::QuotaExceeded
+    )
 }
 
 impl Bus {
@@ -222,10 +262,12 @@ impl Bus {
                 principal,
                 out,
             } => {
+                let owner: Arc<str> = Arc::from(principal.name.as_str());
                 self.sessions.insert(
                     session,
                     Session {
                         principal,
+                        owner,
                         out,
                         target: None,
                         inflight: HashSet::new(),
@@ -265,7 +307,11 @@ impl Bus {
             }
             Frame::Pong { .. } => {}
             other => {
-                tracing::warn!(session, frame = ?other, "unexpected frame, closing session");
+                tracing::warn!(
+                    session,
+                    frame = other.kind(),
+                    "unexpected frame, closing session"
+                );
                 self.send_to(
                     session,
                     Frame::Error {
@@ -324,8 +370,10 @@ impl Bus {
             if entry.key().0 > now {
                 break;
             }
-            match entry.remove() {
+            let (key, timer) = entry.remove_entry();
+            match timer {
                 Timer::Expire(id) => self.fail(id, ErrorCode::Expired, "ttl expired".into()),
+                Timer::Forget(name) => self.forget_target(&name, key),
                 Timer::Retry(id) => {
                     if self
                         .pending
@@ -339,11 +387,49 @@ impl Bus {
         }
     }
 
-    fn validate_send(
-        &self,
-        session: SessionId,
-        envelope: &mut Envelope,
-    ) -> Result<(), (ErrorCode, String)> {
+    fn check_operation(&self, session: SessionId, operation: Operation<'_>) -> Result<(), Failure> {
+        let Some(entry) = self.sessions.get(&session) else {
+            return Err((ErrorCode::Protocol, "unknown session".into()));
+        };
+        let ctx = HookContext {
+            session,
+            principal: &entry.principal.name,
+        };
+        for hook in &self.hooks {
+            hook.on_operation(&ctx, operation)
+                .map_err(|rejection| (rejection.code, rejection.message))?;
+        }
+        Ok(())
+    }
+
+    fn usage_of(&self, owner: &str) -> Option<&Usage> {
+        self.usage.get(owner)
+    }
+
+    fn check_pending_quota(&self, owner: &str, bytes: usize) -> Result<(), Failure> {
+        let (count, used) = self
+            .usage_of(owner)
+            .map_or((0, 0), |usage| (usage.pending, usage.pending_bytes));
+        if count >= self.limits.max_pending_per_principal
+            || used.saturating_add(bytes) > self.limits.max_pending_bytes_per_principal
+        {
+            return Err((
+                ErrorCode::QuotaExceeded,
+                "pending request quota exceeded".into(),
+            ));
+        }
+        if self.pending.len() >= self.limits.max_pending
+            || self.pending_bytes.saturating_add(bytes) > self.limits.max_pending_bytes
+        {
+            return Err((
+                ErrorCode::Overloaded,
+                "bus has too many pending requests".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_send(&self, session: SessionId, envelope: &mut Envelope) -> Result<(), Failure> {
         let Some(caller) = self.sessions.get(&session) else {
             return Err((ErrorCode::Protocol, "unknown session".into()));
         };
@@ -374,23 +460,29 @@ impl Bus {
             hook.on_send(&ctx, envelope)
                 .map_err(|rejection| (rejection.code, rejection.message))?;
         }
-        Ok(())
+        self.check_pending_quota(&caller.owner, retained_bytes(envelope))
+    }
+
+    fn reply_fail(&mut self, session: SessionId, id: u64, (code, message): Failure) {
+        self.send_to(
+            session,
+            Frame::Fail {
+                id,
+                code,
+                message,
+                retryable: is_retryable(code),
+            },
+        );
     }
 
     fn on_send(&mut self, session: SessionId, mut envelope: Envelope) {
         let caller_id = envelope.id;
-        if let Err((code, message)) = self.validate_send(session, &mut envelope) {
-            self.send_to(
-                session,
-                Frame::Fail {
-                    id: caller_id,
-                    code,
-                    message,
-                    retryable: code == ErrorCode::RateLimited,
-                },
-            );
-            return;
+        if let Err(failure) = self.validate_send(session, &mut envelope) {
+            return self.reply_fail(session, caller_id, failure);
         }
+        let Some(owner) = self.sessions.get(&session).map(|s| s.owner.clone()) else {
+            return;
+        };
 
         envelope.ttl = match envelope.ttl {
             0 => self.limits.default_ttl_ms,
@@ -406,10 +498,17 @@ impl Bus {
         self.next_id += 1;
         let deadline = Instant::now() + Duration::from_millis(envelope.ttl);
         let expire_key = self.add_timer(deadline, Timer::Expire(id));
+        let bytes = retained_bytes(&envelope);
+        self.pending_bytes += bytes;
+        let usage = self.usage.entry(owner.clone()).or_default();
+        usage.pending += 1;
+        usage.pending_bytes += bytes;
         self.pending.insert(
             id,
             Pending {
                 caller: session,
+                owner,
+                bytes,
                 caller_id,
                 envelope,
                 attempts: 0,
@@ -520,16 +619,19 @@ impl Bus {
     }
 
     fn resolve_direct(&mut self, key: &str, action: &str) -> Route {
-        if let Some(group) = key.strip_prefix(GROUP_PREFIX) {
+        if let Some(group_name) = key.strip_prefix(GROUP_PREFIX) {
+            let Some(group) = self.groups.get_mut(group_name) else {
+                return Route::Offline;
+            };
             let mut online_members = 0;
             let mut candidates: Vec<(&String, SessionId)> = Vec::new();
-            for (name, entry) in &self.targets {
+            for name in &group.members {
+                let Some(entry) = self.targets.get(name) else {
+                    continue;
+                };
                 let Some(session) = entry.session else {
                     continue;
                 };
-                if !entry.groups.iter().any(|g| g == group) {
-                    continue;
-                }
                 online_members += 1;
                 if entry.action(action).is_some() {
                     candidates.push((name, session));
@@ -545,11 +647,10 @@ impl Bus {
                     Route::Offline
                 };
             }
-            candidates.sort();
-            let cursor = self.group_cursor.entry(group.to_string()).or_default();
-            let (name, session) = candidates[*cursor % candidates.len()];
-            *cursor = cursor.wrapping_add(1);
-            return Route::Online(session, name.clone());
+            let (name, session) = candidates[group.cursor % candidates.len()];
+            let name = name.clone();
+            group.cursor = group.cursor.wrapping_add(1);
+            return Route::Online(session, name);
         }
 
         match self.targets.get(key) {
@@ -586,6 +687,11 @@ impl Bus {
         }
         if let Some(caller) = self.sessions.get_mut(&pending.caller) {
             caller.owned.remove(&id);
+        }
+        self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes);
+        if let Some(usage) = self.usage.get_mut(&pending.owner) {
+            usage.pending = usage.pending.saturating_sub(1);
+            usage.pending_bytes = usage.pending_bytes.saturating_sub(pending.bytes);
         }
         Some(pending)
     }
@@ -705,7 +811,7 @@ impl Bus {
         session: SessionId,
         target: String,
         mut actions: Vec<ActionSpec>,
-        groups: Vec<String>,
+        mut groups: Vec<String>,
     ) {
         let Some(entry) = self.sessions.get(&session) else {
             return;
@@ -731,6 +837,16 @@ impl Bus {
                 format!("not allowed to register '{target}'"),
             );
         }
+        if let Some(group) = groups.iter().find(|g| !entry.principal.may_join(g)) {
+            let message = format!("not allowed to join group '{group}'");
+            return self.session_error(session, ErrorCode::Forbidden, message);
+        }
+        let owner = entry.owner.clone();
+        if let Err((code, message)) =
+            self.check_operation(session, Operation::Register { target: &target })
+        {
+            return self.session_error(session, code, message);
+        }
         if self
             .targets
             .get(&target)
@@ -743,14 +859,31 @@ impl Bus {
             );
         }
 
+        if let Err((code, message)) = self.check_target_quota(&owner, &target) {
+            return self.session_error(session, code, message);
+        }
+
         actions.sort_by(|a, b| a.name.cmp(&b.name));
         actions.dedup_by(|a, b| a.name == b.name);
+        groups.sort();
+        groups.dedup();
+        self.remove_target(&target);
+        for group in &groups {
+            self.groups
+                .entry(group.clone())
+                .or_default()
+                .members
+                .insert(target.clone());
+        }
+        self.usage.entry(owner.clone()).or_default().targets += 1;
         self.targets.insert(
             target.clone(),
             TargetEntry {
                 session: Some(session),
+                owner,
                 actions,
                 groups: groups.clone(),
+                forget_key: None,
             },
         );
         if let Some(entry) = self.sessions.get_mut(&session) {
@@ -779,6 +912,54 @@ impl Bus {
         }
     }
 
+    fn check_target_quota(&self, owner: &str, target: &str) -> Result<(), Failure> {
+        let existing = self.targets.get(target);
+        if existing.is_some_and(|entry| &*entry.owner == owner) {
+            return Ok(());
+        }
+        let owned = self.usage_of(owner).map_or(0, |usage| usage.targets);
+        if owned >= self.limits.max_targets_per_principal {
+            return Err((
+                ErrorCode::QuotaExceeded,
+                "target registration quota exceeded".into(),
+            ));
+        }
+        if existing.is_none() && self.targets.len() >= self.limits.max_targets {
+            return Err((ErrorCode::Overloaded, "target registry is full".into()));
+        }
+        Ok(())
+    }
+
+    fn remove_target(&mut self, name: &str) -> Option<TargetEntry> {
+        let entry = self.targets.remove(name)?;
+        if let Some(key) = entry.forget_key {
+            self.timers.remove(&key);
+        }
+        if let Some(usage) = self.usage.get_mut(&entry.owner) {
+            usage.targets = usage.targets.saturating_sub(1);
+        }
+        for group_name in &entry.groups {
+            if let Some(group) = self.groups.get_mut(group_name) {
+                group.members.remove(name);
+                if group.members.is_empty() {
+                    self.groups.remove(group_name);
+                }
+            }
+        }
+        Some(entry)
+    }
+
+    fn forget_target(&mut self, name: &str, key: (Instant, u64)) {
+        let expired = self
+            .targets
+            .get(name)
+            .is_some_and(|entry| entry.session.is_none() && entry.forget_key == Some(key));
+        if expired {
+            self.remove_target(name);
+            tracing::info!(target = %name, "offline target forgotten");
+        }
+    }
+
     fn drain_queue(&mut self, key: &str) {
         let Some(queue) = self.queues.remove(key) else {
             return;
@@ -792,46 +973,66 @@ impl Bus {
     }
 
     fn on_subscribe(&mut self, session: SessionId, id: u64, target: String, event: String) {
-        let Some(entry) = self.sessions.get(&session) else {
-            return;
-        };
-        let failure = if !valid_pattern(&target, valid_route) || !valid_pattern(&event, valid_name)
-        {
-            Some((
-                ErrorCode::Invalid,
-                "invalid target or event name".to_string(),
-            ))
-        } else if !entry.principal.may_address(&target) {
-            Some((
-                ErrorCode::Forbidden,
-                format!("not allowed to address '{target}'"),
-            ))
-        } else {
-            None
-        };
-        if let Some((code, message)) = failure {
-            self.send_to(
-                session,
-                Frame::Fail {
-                    id,
-                    code,
-                    message,
-                    retryable: false,
-                },
-            );
-            return;
-        }
         let key = (target, event);
-        self.subs.entry(key.clone()).or_default().insert(session);
-        if let Some(entry) = self.sessions.get_mut(&session) {
-            entry.subs.insert(key);
+        let is_new = match self.admit_subscription(session, &key) {
+            Ok(is_new) => is_new,
+            Err(failure) => return self.reply_fail(session, id, failure),
+        };
+        if is_new {
+            let Some(entry) = self.sessions.get_mut(&session) else {
+                return;
+            };
+            entry.subs.insert(key.clone());
+            let owner = entry.owner.clone();
+            self.usage.entry(owner).or_default().subs += 1;
+            self.subs.entry(key).or_default().insert(session);
         }
         self.send_to(session, Frame::Accepted { id });
     }
 
+    fn admit_subscription(
+        &self,
+        session: SessionId,
+        (target, event): &(String, String),
+    ) -> Result<bool, Failure> {
+        let Some(entry) = self.sessions.get(&session) else {
+            return Err((ErrorCode::Protocol, "unknown session".into()));
+        };
+        if !valid_pattern(target, valid_route) || !valid_pattern(event, valid_name) {
+            return Err((ErrorCode::Invalid, "invalid target or event name".into()));
+        }
+        if !entry.principal.may_address(target) {
+            return Err((
+                ErrorCode::Forbidden,
+                format!("not allowed to address '{target}'"),
+            ));
+        }
+        self.check_operation(session, Operation::Subscribe { target, event })?;
+        if entry.subs.contains(&(target.clone(), event.clone())) {
+            return Ok(false);
+        }
+        let principal_subs = self.usage_of(&entry.owner).map_or(0, |usage| usage.subs);
+        if entry.subs.len() >= self.limits.max_subscriptions_per_session
+            || principal_subs >= self.limits.max_subscriptions_per_principal
+        {
+            return Err((
+                ErrorCode::QuotaExceeded,
+                "subscription quota exceeded".into(),
+            ));
+        }
+        Ok(true)
+    }
+
     fn unsubscribe(&mut self, session: SessionId, key: &(String, String)) {
-        if let Some(entry) = self.sessions.get_mut(&session) {
-            entry.subs.remove(key);
+        let Some(entry) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        if !entry.subs.remove(key) {
+            return;
+        }
+        let owner = entry.owner.clone();
+        if let Some(usage) = self.usage.get_mut(&owner) {
+            usage.subs = usage.subs.saturating_sub(1);
         }
         if let Some(subscribers) = self.subs.get_mut(key) {
             subscribers.remove(&session);
@@ -847,6 +1048,13 @@ impl Bus {
         };
         if !valid_name(&event) {
             return self.session_error(session, ErrorCode::Invalid, "invalid event name");
+        }
+        let operation = Operation::Emit {
+            event: &event,
+            payload_bytes: payload.len(),
+        };
+        if let Err((code, message)) = self.check_operation(session, operation) {
+            return self.session_error(session, code, message);
         }
         let groups = self
             .targets
@@ -877,6 +1085,9 @@ impl Bus {
     }
 
     fn on_list(&mut self, session: SessionId, id: u64) {
+        if let Err(failure) = self.check_operation(session, Operation::ListTargets) {
+            return self.reply_fail(session, id, failure);
+        }
         let Some(entry) = self.sessions.get(&session) else {
             return;
         };
@@ -904,11 +1115,21 @@ impl Bus {
             hook.on_disconnect(session);
         }
         if let Some(name) = &entry.target
-            && let Some(target) = self.targets.get_mut(name)
-            && target.session == Some(session)
+            && self
+                .targets
+                .get(name)
+                .is_some_and(|target| target.session == Some(session))
         {
-            target.session = None;
+            let retention = Duration::from_millis(self.limits.offline_target_retention_ms);
+            let key = self.add_timer(Instant::now() + retention, Timer::Forget(name.clone()));
+            if let Some(target) = self.targets.get_mut(name) {
+                target.session = None;
+                target.forget_key = Some(key);
+            }
             tracing::info!(session, target = %name, "target offline");
+        }
+        if let Some(usage) = self.usage.get_mut(&entry.owner) {
+            usage.subs = usage.subs.saturating_sub(entry.subs.len());
         }
         for id in entry.owned {
             self.finish(id);

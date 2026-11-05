@@ -63,25 +63,42 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
 - `[server]`: `tcp`, `ws`, `unix` listen addresses (at least one) and `unix_mode`
   (default `0o600`). An existing stale socket file is replaced; a live one is not.
 - `[limits]`: frame size, per-target queue length, default and maximum TTL,
-  maximum retry attempts and backoff, handshake timeout, per-session buffer.
+  maximum retry attempts and backoff, handshake timeout, per-session buffer,
+  and resource quotas:
+  - `max_pending` / `max_pending_bytes`: requests the bus holds at once
+    (queued or in flight) across everyone, by count and by retained bytes
+    (payload plus names). `max_pending_per_principal` /
+    `max_pending_bytes_per_principal` apply the same per principal.
+  - `max_subscriptions_per_session` / `max_subscriptions_per_principal`.
+  - `max_targets` / `max_targets_per_principal`: registry size, counting
+    offline targets. Re-registering a name you already own is always allowed.
+  - `offline_target_retention_ms`: how long an offline target's actions and
+    groups are kept before it is forgotten (default one hour). Messages for a
+    forgotten name still queue.
 - `[auth]`: `[auth.anonymous]` grant (absent means anonymous is refused) and
   `[[auth.tokens]]`. Tokens are stored as SHA-256 hashes: generate one with
   `printf '%s' "$TOKEN" | sarca hash-token`. A config file without an `[auth]`
   section refuses everyone.
-- `[rate_limit]`: token bucket per session (`per_second`, `burst`).
+- `[rate_limit]`: token bucket per session (`per_second`, `burst`). Every
+  `send`, `subscribe`, `emit`, `list_targets` and `register` costs one token.
 - `log_messages`: log routing metadata for every send (never payloads).
+  Unexpected frames are logged by frame type only, never their contents.
 - `[[rules]]`: `when_down = "name"`, `route_to = ["backup", "group:pool"]`.
   Backups are tried in order when the primary is offline; otherwise the message
   queues for the primary and is flushed when it, or a backup, registers.
 
 ### Grants
 
-Each grant has three lists of glob patterns (`*` matches any run of characters):
+Each grant has four lists of glob patterns (`*` matches any run of characters):
 
 - `caps`: capability scopes the principal may claim in an envelope.
 - `register`: target names the principal may register as.
 - `send`: targets (and `group:` names) the principal may send to, subscribe to
   and see in `targets`.
+- `groups`: group names (without the `group:` prefix) a target registered by
+  the principal may join. A registration naming any group outside this list is
+  refused with `forbidden`. Empty by default, so tokens that register grouped
+  targets need it set explicitly.
 
 A target may require capabilities per action. A request reaches the target only
 if the envelope claims every capability the action requires, and the bus has
@@ -100,6 +117,9 @@ verified the caller holds every claimed capability. Targets receive the verified
 - Fire-and-forget gets an `accepted` reply once the bus has delivered or queued
   it. Later failures (expiry, full queue on retry) are logged, not reported.
 - `group:<name>` round-robins across online members that support the action.
+- Sends beyond a principal's pending quota fail with `quota_exceeded`; beyond
+  the bus-wide totals, with `overloaded`. Both are marked retryable. The same
+  codes apply to subscription and registration quotas.
 - If a caller disconnects, its outstanding requests are dropped.
 
 ## Wire protocol
@@ -145,7 +165,7 @@ Session flow:
 
 Error codes: `protocol`, `unauthorized`, `forbidden`, `invalid`, `name_taken`,
 `unknown_action`, `queue_full`, `rate_limited`, `rejected`, `expired`,
-`unavailable`, `target_failed`.
+`unavailable`, `target_failed`, `overloaded`, `quota_exceeded`.
 
 ## Rust SDK
 
@@ -179,14 +199,29 @@ only on fatal refusals (bad token, forbidden name, invalid registration). A
 (`call.is_local()`), whether or not the bus is reachable. `target.handle()`
 returns a `TargetHandle` for `emit`.
 
+`TargetConfig::max_concurrent` (default 64) bounds handlers running at once.
+Deliveries beyond it are answered immediately with a retryable `overloaded`
+failure (fire-and-forget deliveries are dropped and logged). Each handler is
+cancelled when the delivery's TTL runs out, reporting `expired`, and all
+running handlers are cancelled when the connection to the bus drops (the bus
+retries in-flight requests according to their retry policy).
+
+On the client, each stream buffers up to 256 unread items. If the receiver falls
+further behind, the stream ends with an `overloaded` error instead of stalling
+the connection, and later items for it are discarded.
+
 ## Plugin hooks
 
 Implement `sarca::hooks::Hook` and pass it to `Server::bind(&config, hooks)`:
 
 ```rust
 fn on_send(&self, ctx: &HookContext<'_>, envelope: &mut Envelope) -> Result<(), Rejection>;
+fn on_operation(&self, ctx: &HookContext<'_>, operation: Operation<'_>) -> Result<(), Rejection> { Ok(()) }
 fn on_disconnect(&self, session: u64) {}
 ```
+
+`on_operation` runs before `register`, `subscribe`, `emit` and `list_targets`
+and may reject them.
 
 Hooks run in order on every send, after authorisation, and may rewrite the
 envelope (payload transforms) or reject it. Built-ins: rate limiting and message

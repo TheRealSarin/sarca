@@ -249,6 +249,7 @@ async fn tokens_are_required_and_scoped() {
                         caps: vec![],
                         register: vec!["game-*".into()],
                         send: vec![],
+                        groups: vec![],
                     },
                 },
                 TokenConfig {
@@ -258,6 +259,7 @@ async fn tokens_are_required_and_scoped() {
                         caps: vec![],
                         register: vec![],
                         send: vec!["game-*".into()],
+                        groups: vec![],
                     },
                 },
             ],

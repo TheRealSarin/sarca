@@ -8,6 +8,7 @@ pub struct Principal {
     caps: Vec<String>,
     register: Vec<String>,
     send: Vec<String>,
+    groups: Vec<String>,
 }
 
 impl Principal {
@@ -17,6 +18,7 @@ impl Principal {
             caps: grant.caps.clone(),
             register: grant.register.clone(),
             send: grant.send.clone(),
+            groups: grant.groups.clone(),
         }
     }
 
@@ -32,6 +34,10 @@ impl Principal {
 
     pub fn may_address(&self, target: &str) -> bool {
         self.send.iter().any(|pattern| glob_match(pattern, target))
+    }
+
+    pub fn may_join(&self, group: &str) -> bool {
+        self.groups.iter().any(|pattern| glob_match(pattern, group))
     }
 }
 
@@ -132,6 +138,7 @@ mod tests {
                 caps: vec![],
                 register: vec![],
                 send: vec!["public-*".into()],
+                groups: vec![],
             }),
             tokens: vec![TokenConfig {
                 name: "ops".into(),
@@ -140,6 +147,7 @@ mod tests {
                     caps: vec!["game.*".into()],
                     register: vec!["game-*".into()],
                     send: vec!["*".into()],
+                    groups: vec!["games".into()],
                 },
             }],
         })
@@ -155,6 +163,8 @@ mod tests {
         assert!(ops.may_register("game-1"));
         assert!(!ops.may_register("db"));
         assert!(ops.may_address("group:games"));
+        assert!(ops.may_join("games"));
+        assert!(!ops.may_join("production"));
         assert!(auth.authenticate(Some("wrong")).is_none());
     }
 
@@ -164,6 +174,7 @@ mod tests {
         assert!(anon.may_address("public-status"));
         assert!(!anon.may_address("game-1"));
         assert!(!anon.may_register("public-x"));
+        assert!(!anon.may_join("games"));
         let closed = Authenticator::new(&AuthConfig::default());
         assert!(closed.authenticate(None).is_none());
     }

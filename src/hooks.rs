@@ -25,8 +25,32 @@ impl Rejection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation<'a> {
+    Register {
+        target: &'a str,
+    },
+    Subscribe {
+        target: &'a str,
+        event: &'a str,
+    },
+    Emit {
+        event: &'a str,
+        payload_bytes: usize,
+    },
+    ListTargets,
+}
+
 pub trait Hook: Send + Sync {
     fn on_send(&self, ctx: &HookContext<'_>, envelope: &mut Envelope) -> Result<(), Rejection>;
+
+    fn on_operation(
+        &self,
+        _ctx: &HookContext<'_>,
+        _operation: Operation<'_>,
+    ) -> Result<(), Rejection> {
+        Ok(())
+    }
 
     fn on_disconnect(&self, _session: u64) {}
 }
@@ -88,9 +112,9 @@ impl RateLimitHook {
     }
 }
 
-impl Hook for RateLimitHook {
-    fn on_send(&self, ctx: &HookContext<'_>, _envelope: &mut Envelope) -> Result<(), Rejection> {
-        if self.take(ctx.session, Instant::now()) {
+impl RateLimitHook {
+    fn admit(&self, session: u64) -> Result<(), Rejection> {
+        if self.take(session, Instant::now()) {
             Ok(())
         } else {
             Err(Rejection::new(
@@ -98,6 +122,20 @@ impl Hook for RateLimitHook {
                 "rate limit exceeded",
             ))
         }
+    }
+}
+
+impl Hook for RateLimitHook {
+    fn on_send(&self, ctx: &HookContext<'_>, _envelope: &mut Envelope) -> Result<(), Rejection> {
+        self.admit(ctx.session)
+    }
+
+    fn on_operation(
+        &self,
+        ctx: &HookContext<'_>,
+        _operation: Operation<'_>,
+    ) -> Result<(), Rejection> {
+        self.admit(ctx.session)
     }
 
     fn on_disconnect(&self, session: u64) {

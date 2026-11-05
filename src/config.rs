@@ -83,6 +83,45 @@ impl Config {
         if self.limits.max_attempts == 0 {
             return invalid("limits.max_attempts must be at least 1".into());
         }
+        let limits = &self.limits;
+        let positive = [
+            ("max_queue_per_target", limits.max_queue_per_target),
+            ("max_pending", limits.max_pending),
+            ("max_pending_bytes", limits.max_pending_bytes),
+            (
+                "max_pending_per_principal",
+                limits.max_pending_per_principal,
+            ),
+            (
+                "max_pending_bytes_per_principal",
+                limits.max_pending_bytes_per_principal,
+            ),
+            (
+                "max_subscriptions_per_session",
+                limits.max_subscriptions_per_session,
+            ),
+            (
+                "max_subscriptions_per_principal",
+                limits.max_subscriptions_per_principal,
+            ),
+            ("max_targets", limits.max_targets),
+            (
+                "max_targets_per_principal",
+                limits.max_targets_per_principal,
+            ),
+        ];
+        if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
+            return invalid(format!("limits.{name} must be at least 1"));
+        }
+        if limits.max_pending_per_principal > limits.max_pending
+            || limits.max_pending_bytes_per_principal > limits.max_pending_bytes
+            || limits.max_subscriptions_per_session > limits.max_subscriptions_per_principal
+            || limits.max_targets_per_principal > limits.max_targets
+        {
+            return invalid(
+                "per-principal and per-session limits must not exceed their totals".into(),
+            );
+        }
         for token in &self.auth.tokens {
             let ok =
                 token.sha256.len() == 64 && token.sha256.bytes().all(|b| b.is_ascii_hexdigit());
@@ -149,6 +188,15 @@ pub struct Limits {
     pub max_backoff_ms: u64,
     pub handshake_timeout_ms: u64,
     pub session_buffer: usize,
+    pub max_pending: usize,
+    pub max_pending_bytes: usize,
+    pub max_pending_per_principal: usize,
+    pub max_pending_bytes_per_principal: usize,
+    pub max_subscriptions_per_session: usize,
+    pub max_subscriptions_per_principal: usize,
+    pub max_targets: usize,
+    pub max_targets_per_principal: usize,
+    pub offline_target_retention_ms: u64,
 }
 
 impl Default for Limits {
@@ -162,6 +210,15 @@ impl Default for Limits {
             max_backoff_ms: 60_000,
             handshake_timeout_ms: 5_000,
             session_buffer: 1024,
+            max_pending: 100_000,
+            max_pending_bytes: 256 * 1024 * 1024,
+            max_pending_per_principal: 10_000,
+            max_pending_bytes_per_principal: 64 * 1024 * 1024,
+            max_subscriptions_per_session: 256,
+            max_subscriptions_per_principal: 4_096,
+            max_targets: 10_000,
+            max_targets_per_principal: 1_000,
+            offline_target_retention_ms: 3_600_000,
         }
     }
 }
@@ -183,6 +240,8 @@ pub struct Grant {
     pub register: Vec<String>,
     #[serde(default)]
     pub send: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 impl Grant {
@@ -191,6 +250,7 @@ impl Grant {
             caps: vec!["*".into()],
             register: vec!["*".into()],
             send: vec!["*".into()],
+            groups: vec!["*".into()],
         }
     }
 }
@@ -245,6 +305,7 @@ mod tests {
             caps = ["game.admin"]
             register = ["game-*"]
             send = ["*"]
+            groups = ["games"]
 
             [rate_limit]
             per_second = 50
@@ -260,6 +321,7 @@ mod tests {
         assert_eq!(config.limits.max_queue_per_target, 10);
         assert_eq!(config.limits.default_ttl_ms, 30_000);
         assert_eq!(config.auth.tokens[0].grant.caps, vec!["game.admin"]);
+        assert_eq!(config.auth.tokens[0].grant.groups, vec!["games"]);
         assert_eq!(config.rules[0].route_to.len(), 2);
     }
 
@@ -272,6 +334,9 @@ mod tests {
             "[[rules]]\nwhen_down = \"a\"\nroute_to = []\n",
             "[rate_limit]\nper_second = 0\nburst = 1\n",
             "[limits]\nmax_attempts = 0\n",
+            "[limits]\nmax_pending = 0\n",
+            "[limits]\nmax_targets = 10\nmax_targets_per_principal = 20\n",
+            "[limits]\nmax_subscriptions_per_session = 0\n",
             "[limits]\ndefault_ttl_ms = 10\nmax_ttl_ms = 5\n",
         ];
         for case in cases {

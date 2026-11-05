@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use sarca::auth::{Authenticator, Principal, hash_token};
 use sarca::bus::{self, BusHandle, SessionId};
-use sarca::config::{AuthConfig, Config, Grant, Rule, TokenConfig};
+use sarca::config::{AuthConfig, Config, Grant, RateLimit, Rule, TokenConfig};
 use sarca::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode, Retry};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -326,6 +326,7 @@ async fn capabilities_are_enforced() {
                 caps: vec![],
                 register: vec!["*".into()],
                 send: vec!["*".into()],
+                groups: vec![],
             }),
             tokens: vec![TokenConfig {
                 name: "ops".into(),
@@ -334,6 +335,7 @@ async fn capabilities_are_enforced() {
                     caps: vec!["game.admin".into()],
                     register: vec![],
                     send: vec!["game-*".into()],
+                    groups: vec![],
                 },
             }],
         },
@@ -564,4 +566,247 @@ async fn requests_of_a_disconnected_caller_are_dropped() {
     let mut target = Peer::connect(&bus, anyone()).await;
     target.register("later", &["op"], &[]).await;
     target.assert_silent().await;
+}
+
+fn principal(name: &str, grant: Grant) -> Principal {
+    let token = format!("{name}-token");
+    Authenticator::new(&AuthConfig {
+        anonymous: None,
+        tokens: vec![TokenConfig {
+            name: name.into(),
+            sha256: hash_token(&token),
+            grant,
+        }],
+    })
+    .authenticate(Some(&token))
+    .unwrap()
+}
+
+async fn expect_error(peer: &mut Peer) -> ErrorCode {
+    match peer.recv().await {
+        Frame::Error { code, .. } => code,
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+fn subscribe(id: u64, target: &str, event: &str) -> Frame {
+    Frame::Subscribe {
+        id,
+        target: target.into(),
+        event: event.into(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn joining_a_group_requires_a_group_grant() {
+    let bus = start(Config::default());
+    let grant = Grant {
+        register: vec!["dev-*".into()],
+        groups: vec!["dev".into()],
+        ..Grant::default()
+    };
+    let mut intruder = Peer::connect(&bus, principal("dev", grant.clone())).await;
+    intruder
+        .send(Frame::Register {
+            target: "dev-worker".into(),
+            actions: vec![ActionSpec::new("deploy")],
+            groups: vec!["dev".into(), "production".into()],
+        })
+        .await;
+    assert_eq!(expect_error(&mut intruder).await, ErrorCode::Forbidden);
+
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    let mut env = envelope(1, "group:production", "deploy", b"secret");
+    env.ttl = 1_000;
+    caller.send(Frame::Send(env)).await;
+    assert_eq!(expect_fail(&mut caller).await, (1, ErrorCode::Expired));
+
+    let mut worker = Peer::connect(&bus, principal("dev", grant)).await;
+    worker.register("dev-worker", &["deploy"], &["dev"]).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_requests_are_bounded_by_count_and_bytes() {
+    let mut config = Config::default();
+    config.limits.max_pending = 3;
+    config.limits.max_pending_per_principal = 2;
+    config.limits.max_pending_bytes_per_principal = 100;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("slow", &["op"], &[]).await;
+    let mut alice = Peer::connect(&bus, principal("alice", Grant::everything())).await;
+    let mut bob = Peer::connect(&bus, principal("bob", Grant::everything())).await;
+
+    alice
+        .send(Frame::Send(envelope(1, "slow", "op", &[0; 200])))
+        .await;
+    assert_eq!(expect_fail(&mut alice).await, (1, ErrorCode::QuotaExceeded));
+
+    alice
+        .send(Frame::Send(envelope(2, "slow", "op", b"")))
+        .await;
+    alice
+        .send(Frame::Send(envelope(3, "other", "op", b"")))
+        .await;
+    alice
+        .send(Frame::Send(envelope(4, "slow", "op", b"")))
+        .await;
+    assert_eq!(expect_fail(&mut alice).await, (4, ErrorCode::QuotaExceeded));
+
+    bob.send(Frame::Send(envelope(5, "slow", "op", b""))).await;
+    bob.send(Frame::Send(envelope(6, "slow", "op", b""))).await;
+    assert_eq!(expect_fail(&mut bob).await, (6, ErrorCode::Overloaded));
+
+    let first = expect_deliver(&mut target).await;
+    target
+        .send(Frame::Reply {
+            id: first.id,
+            payload: vec![],
+        })
+        .await;
+    assert!(matches!(alice.recv().await, Frame::Reply { id: 2, .. }));
+    alice
+        .send(Frame::Send(envelope(7, "slow", "op", b"")))
+        .await;
+    expect_deliver(&mut target).await;
+    expect_deliver(&mut target).await;
+    alice.assert_silent().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscriptions_are_capped_per_session() {
+    let mut config = Config::default();
+    config.limits.max_subscriptions_per_session = 2;
+    let bus = start(config);
+    let mut peer = Peer::connect(&bus, anyone()).await;
+    peer.send(subscribe(1, "t", "a")).await;
+    peer.send(subscribe(2, "t", "b")).await;
+    peer.send(subscribe(3, "t", "a")).await;
+    peer.send(subscribe(4, "t", "c")).await;
+    assert_eq!(peer.recv().await, Frame::Accepted { id: 1 });
+    assert_eq!(peer.recv().await, Frame::Accepted { id: 2 });
+    assert_eq!(peer.recv().await, Frame::Accepted { id: 3 });
+    assert_eq!(expect_fail(&mut peer).await, (4, ErrorCode::QuotaExceeded));
+
+    peer.send(Frame::Unsubscribe {
+        target: "t".into(),
+        event: "a".into(),
+    })
+    .await;
+    peer.send(subscribe(5, "t", "c")).await;
+    assert_eq!(peer.recv().await, Frame::Accepted { id: 5 });
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscriptions_are_capped_per_principal_across_sessions() {
+    let mut config = Config::default();
+    config.limits.max_subscriptions_per_principal = 1;
+    let bus = start(config);
+    let mut first = Peer::connect(&bus, anyone()).await;
+    let mut second = Peer::connect(&bus, anyone()).await;
+    first.send(subscribe(1, "t", "a")).await;
+    assert_eq!(first.recv().await, Frame::Accepted { id: 1 });
+    second.send(subscribe(2, "t", "b")).await;
+    assert_eq!(
+        expect_fail(&mut second).await,
+        (2, ErrorCode::QuotaExceeded)
+    );
+    first.disconnect().await;
+    second.send(subscribe(3, "t", "b")).await;
+    assert_eq!(second.recv().await, Frame::Accepted { id: 3 });
+}
+
+#[tokio::test(start_paused = true)]
+async fn offline_registrations_are_bounded_and_expire() {
+    let mut config = Config::default();
+    config.limits.max_targets_per_principal = 1;
+    config.limits.offline_target_retention_ms = 10_000;
+    let bus = start(config);
+
+    let mut first = Peer::connect(&bus, anyone()).await;
+    first.register("old", &["op"], &["pool"]).await;
+    first.disconnect().await;
+
+    let mut second = Peer::connect(&bus, anyone()).await;
+    second
+        .send(Frame::Register {
+            target: "new".into(),
+            actions: vec![],
+            groups: vec![],
+        })
+        .await;
+    assert_eq!(expect_error(&mut second).await, ErrorCode::QuotaExceeded);
+    second.register("old", &["op"], &["pool"]).await;
+    second.disconnect().await;
+
+    tokio::time::sleep(Duration::from_millis(10_001)).await;
+    let mut lister = Peer::connect(&bus, anyone()).await;
+    lister.send(Frame::ListTargets { id: 1 }).await;
+    let Frame::Targets { targets, .. } = lister.recv().await else {
+        panic!("expected targets");
+    };
+    assert!(targets.is_empty(), "offline target was not forgotten");
+
+    let mut third = Peer::connect(&bus, anyone()).await;
+    third.register("new", &["op"], &["pool"]).await;
+    lister
+        .send(Frame::Send(envelope(2, "group:pool", "op", b"")))
+        .await;
+    assert_eq!(expect_deliver(&mut third).await.target, "new");
+}
+
+#[tokio::test(start_paused = true)]
+async fn global_target_registry_is_bounded() {
+    let mut config = Config::default();
+    config.limits.max_targets = 1;
+    let bus = start(config);
+    let mut first = Peer::connect(&bus, principal("a", Grant::everything())).await;
+    first.register("one", &[], &[]).await;
+    let mut second = Peer::connect(&bus, principal("b", Grant::everything())).await;
+    second
+        .send(Frame::Register {
+            target: "two".into(),
+            actions: vec![],
+            groups: vec![],
+        })
+        .await;
+    assert_eq!(expect_error(&mut second).await, ErrorCode::Overloaded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rate_limit_covers_non_send_operations() {
+    let config = Config {
+        rate_limit: Some(RateLimit {
+            per_second: 0.001,
+            burst: 1.0,
+        }),
+        ..Config::default()
+    };
+    let bus = start(config);
+
+    let mut lister = Peer::connect(&bus, anyone()).await;
+    lister.send(Frame::ListTargets { id: 1 }).await;
+    assert!(matches!(lister.recv().await, Frame::Targets { id: 1, .. }));
+    lister.send(Frame::ListTargets { id: 2 }).await;
+    assert_eq!(expect_fail(&mut lister).await, (2, ErrorCode::RateLimited));
+
+    let mut subscriber = Peer::connect(&bus, anyone()).await;
+    subscriber.send(subscribe(3, "*", "*")).await;
+    assert_eq!(subscriber.recv().await, Frame::Accepted { id: 3 });
+    subscriber.send(subscribe(4, "t", "*")).await;
+    assert_eq!(
+        expect_fail(&mut subscriber).await,
+        (4, ErrorCode::RateLimited)
+    );
+
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &[], &[]).await;
+    target
+        .send(Frame::Emit {
+            event: "spam".into(),
+            payload: vec![0; 1024],
+        })
+        .await;
+    assert_eq!(expect_error(&mut target).await, ErrorCode::RateLimited);
+    subscriber.assert_silent().await;
 }

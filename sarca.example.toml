@@ -15,6 +15,15 @@ max_attempts = 10
 max_backoff_ms = 60000
 handshake_timeout_ms = 5000
 session_buffer = 1024
+max_pending = 100000
+max_pending_bytes = 268435456
+max_pending_per_principal = 10000
+max_pending_bytes_per_principal = 67108864
+max_subscriptions_per_session = 256
+max_subscriptions_per_principal = 4096
+max_targets = 10000
+max_targets_per_principal = 1000
+offline_target_retention_ms = 3600000
 
 [rate_limit]
 per_second = 100
@@ -30,6 +39,7 @@ send = ["*"]
 name = "game-servers"
 sha256 = "replace-with-output-of-sarca-hash-token-1111111111111111111111111"
 register = ["game-*"]
+groups = ["games"]
 
 [[rules]]
 when_down = "game-1"
