@@ -1279,3 +1279,44 @@ async fn failure_message_too_large_to_relay_is_replaced() {
     }
     assert!(!caller.rx.is_closed());
 }
+
+#[tokio::test(start_paused = true)]
+async fn offline_primary_without_the_action_still_falls_back() {
+    let config = Config {
+        rules: vec![Rule {
+            when_down: "primary".into(),
+            route_to: vec!["backup".into()],
+        }],
+        ..Config::default()
+    };
+    let bus = start(config);
+    let mut primary = Peer::connect(&bus, anyone()).await;
+    primary.register("primary", &["old"], &[]).await;
+    primary.disconnect().await;
+    let mut backup = Peer::connect(&bus, anyone()).await;
+    backup.register("backup", &["new"], &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+
+    caller
+        .send(Frame::Send(envelope(1, "primary", "new", b"job")))
+        .await;
+    let delivered = expect_deliver(&mut backup).await;
+    assert_eq!(delivered.target, "backup");
+    assert_eq!(delivered.payload, b"job");
+    backup
+        .send(Frame::Reply {
+            id: delivered.id,
+            payload: vec![],
+        })
+        .await;
+    assert!(matches!(caller.recv().await, Frame::Reply { id: 1, .. }));
+
+    backup.disconnect().await;
+    caller
+        .send(Frame::Send(envelope(2, "primary", "new", b"")))
+        .await;
+    assert_eq!(
+        expect_fail(&mut caller).await,
+        (2, ErrorCode::UnknownAction)
+    );
+}

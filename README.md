@@ -105,7 +105,10 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
 - `[[rules]]`: `when_down = "name"`, `route_to = ["backup", "group:pool"]`.
   Backups are tried in order when the primary is offline, skipping any backup
   the sender's `send` grant does not cover; otherwise the message queues for
-  the primary and is flushed when it, or a backup, registers.
+  the primary and is flushed when it, or a backup, registers. The offline
+  primary's remembered actions are checked only after its backups, so an
+  action it does not list fails with `unknown_action` only when no backup can
+  take the message.
 
 ### Grants
 

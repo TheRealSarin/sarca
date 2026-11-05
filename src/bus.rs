@@ -301,6 +301,13 @@ fn is_retryable(code: ErrorCode) -> bool {
     )
 }
 
+fn unsupported(key: &str, action: &str) -> Route {
+    Route::Reject(
+        ErrorCode::UnknownAction,
+        format!("'{key}' does not support '{action}'"),
+    )
+}
+
 impl Bus {
     async fn run(mut self, mut rx: mpsc::Receiver<BusEvent>) {
         loop {
@@ -799,7 +806,17 @@ impl Bus {
                         Route::Offline | Route::Reject(..) => {}
                     }
                 }
-                if busy { Route::Busy } else { Route::Offline }
+                let known_unsupported = self
+                    .targets
+                    .get(key)
+                    .is_some_and(|entry| entry.action(action).is_none());
+                if busy {
+                    Route::Busy
+                } else if known_unsupported {
+                    unsupported(key, action)
+                } else {
+                    Route::Offline
+                }
             }
             route => route,
         }
@@ -857,10 +874,9 @@ impl Bus {
 
         match self.targets.get(key) {
             None => Route::Offline,
-            Some(entry) if entry.action(action).is_none() => Route::Reject(
-                ErrorCode::UnknownAction,
-                format!("'{key}' does not support '{action}'"),
-            ),
+            Some(entry) if entry.session.is_some() && entry.action(action).is_none() => {
+                unsupported(key, action)
+            }
             Some(entry) => match entry.session {
                 Some(session) if self.has_room(session, base + key.len()) => {
                     Route::Online(session, key.to_string())
