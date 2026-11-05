@@ -12,7 +12,7 @@ use crate::footprint;
 use crate::hooks::{Hook, HookContext, LoggingHook, Operation, RateLimitHook};
 use crate::outbound::{self, ByteBudget, OfferError, Outbound, OutboundSender};
 use crate::wire::{
-    ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, MAX_NAME_LEN, Mode, TargetInfo,
+    self, ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, MAX_NAME_LEN, Mode, TargetInfo,
     valid_name,
 };
 
@@ -558,10 +558,25 @@ impl Bus {
             hook.on_send(&ctx, envelope)
                 .map_err(|rejection| (rejection.code, rejection.message))?;
         }
-        if footprint::delivery_bytes(envelope, "") + MAX_NAME_LEN > self.outbound_fit {
+        if footprint::delivery_bytes(envelope, "") + MAX_NAME_LEN > self.outbound_fit
+            || !self.delivery_fits_frame(envelope)
+        {
             return Err((ErrorCode::Invalid, "message is too large to deliver".into()));
         }
         self.check_pending_quota(&caller.owner, retained_bytes(envelope))
+    }
+
+    fn delivery_fits_frame(&self, envelope: &Envelope) -> bool {
+        let may_reroute =
+            envelope.target.starts_with(GROUP_PREFIX) || self.rules.contains_key(&envelope.target);
+        let longest_name = may_reroute.then(|| "x".repeat(MAX_NAME_LEN));
+        let target = longest_name.as_deref().unwrap_or(&envelope.target);
+        wire::max_deliver_len(envelope, target).is_ok_and(|len| len <= self.limits.max_frame_bytes)
+    }
+
+    fn forwardable(&self, frame: &Frame) -> bool {
+        footprint::frame_bytes(frame) <= self.outbound_fit
+            && wire::encoded_len(frame).is_ok_and(|len| len <= self.limits.max_frame_bytes)
     }
 
     fn reply_fail(&mut self, session: SessionId, id: u64, (code, message): Failure) {
@@ -897,15 +912,17 @@ impl Bus {
             tracing::debug!(id, ?code, ?message, "fire-and-forget message dropped");
             return;
         }
-        self.send_to(
-            pending.caller,
-            Frame::Fail {
-                id: pending.caller_id,
-                code,
-                message,
-                retryable: false,
-            },
-        );
+        let failure = |message| Frame::Fail {
+            id: pending.caller_id,
+            code,
+            message,
+            retryable: false,
+        };
+        let mut frame = failure(message);
+        if !self.forwardable(&frame) {
+            frame = failure("failure message is too large to deliver".into());
+        }
+        self.send_to(pending.caller, frame);
     }
 
     fn retry_or_fail(&mut self, id: u64, code: ErrorCode, message: String) -> bool {
@@ -958,7 +975,7 @@ impl Bus {
             | Frame::Fail { id, .. } => *id,
             _ => return,
         };
-        let Some(pending) = self.pending.get_mut(&id) else {
+        let Some(pending) = self.pending.get(&id) else {
             return;
         };
         if pending.stage != Stage::InFlight(session) {
@@ -969,24 +986,30 @@ impl Bus {
         let caller_id = pending.caller_id;
         match frame {
             Frame::Reply { payload, .. } => {
+                let reply = Frame::Reply {
+                    id: caller_id,
+                    payload,
+                };
+                if !self.forwardable(&reply) {
+                    let message = "reply is too large to deliver".into();
+                    return self.fail(id, ErrorCode::TargetFailed, message);
+                }
                 self.finish(id);
-                self.send_to(
-                    caller,
-                    Frame::Reply {
-                        id: caller_id,
-                        payload,
-                    },
-                );
+                self.send_to(caller, reply);
             }
             Frame::StreamItem { payload, .. } if is_stream => {
-                pending.streamed = true;
-                self.send_to(
-                    caller,
-                    Frame::StreamItem {
-                        id: caller_id,
-                        payload,
-                    },
-                );
+                let item = Frame::StreamItem {
+                    id: caller_id,
+                    payload,
+                };
+                if !self.forwardable(&item) {
+                    let message = "stream item is too large to deliver".into();
+                    return self.fail(id, ErrorCode::TargetFailed, message);
+                }
+                if let Some(pending) = self.pending.get_mut(&id) {
+                    pending.streamed = true;
+                }
+                self.send_to(caller, item);
             }
             Frame::StreamEnd { .. } if is_stream => {
                 self.finish(id);
@@ -1329,6 +1352,13 @@ impl Bus {
             event,
             payload,
         };
+        if !self.forwardable(&frame) {
+            return self.session_error(
+                session,
+                ErrorCode::Invalid,
+                "event is too large to deliver",
+            );
+        }
         let bytes = footprint::frame_bytes(&frame);
         for recipient in recipients {
             self.send_lazy(recipient, bytes, || frame.clone());

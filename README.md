@@ -149,7 +149,14 @@ Every frame is a msgpack **map** (named fields) with a string `type` field.
 
 - TCP and unix socket: each frame is prefixed by a 4-byte big-endian length.
 - WebSocket: each binary message is one frame. Text messages are rejected.
-- Frames over `max_frame_bytes` close the connection.
+- Frames over `max_frame_bytes` close the connection. The bus never forwards
+  a frame over that limit or over the outbound budgets:
+  - a `send` whose `deliver` could exceed them is refused with `invalid`. The
+    check allows for the bus's own id and TTL and, for `group:` targets and
+    rule fallbacks, a 256-byte target name;
+  - an `emit` too large to forward is answered with an `invalid` error;
+  - a reply or stream item too large to relay fails the request with
+    `target_failed`, and a failure message too large to relay is replaced.
 
 Envelope fields (used by `send` and `deliver`):
 

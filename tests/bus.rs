@@ -4,7 +4,7 @@ use sarca::auth::{Authenticator, Principal, hash_token};
 use sarca::bus::{self, BusHandle, SessionId};
 use sarca::config::{AuthConfig, Config, Grant, RateLimit, Rule, TokenConfig};
 use sarca::outbound::Outbound;
-use sarca::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode, Retry};
+use sarca::wire::{self, ActionSpec, Envelope, ErrorCode, Frame, Mode, Retry};
 use tokio::time::Instant;
 
 const RECV_DEADLINE: Duration = Duration::from_secs(3600);
@@ -1148,4 +1148,134 @@ async fn message_that_can_never_fit_a_session_is_rejected() {
         .await;
     assert_eq!(expect_fail(&mut caller).await, (1, ErrorCode::Invalid));
     target.assert_silent().await;
+}
+
+fn with_small_frames() -> Config {
+    let mut config = Config::default();
+    config.limits.max_frame_bytes = 1024;
+    config
+}
+
+fn encoded_len(frame: &Frame) -> usize {
+    wire::encode(frame).unwrap().len()
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_whose_delivery_could_exceed_the_frame_limit_is_rejected() {
+    let bus = start(with_small_frames());
+    let mut member = Peer::connect(&bus, anyone()).await;
+    member.register(&"m".repeat(200), &["op"], &["pool"]).await;
+    let mut direct = Peer::connect(&bus, anyone()).await;
+    direct.register("d", &["op"], &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+
+    let grouped = Frame::Send(envelope(1, "group:pool", "op", &[0; 800]));
+    assert!(encoded_len(&grouped) <= 1024);
+    caller.send(grouped).await;
+    assert_eq!(expect_fail(&mut caller).await, (1, ErrorCode::Invalid));
+    member.assert_silent().await;
+    assert!(!member.rx.is_closed());
+
+    caller
+        .send(Frame::Send(envelope(2, "group:pool", "op", &[0; 500])))
+        .await;
+    let delivered = expect_deliver(&mut member).await;
+    assert!(encoded_len(&Frame::Deliver(delivered)) <= 1024);
+
+    caller
+        .send(Frame::Send(envelope(3, "d", "op", &[0; 850])))
+        .await;
+    let delivered = expect_deliver(&mut direct).await;
+    assert!(encoded_len(&Frame::Deliver(delivered)) <= 1024);
+}
+
+#[tokio::test(start_paused = true)]
+async fn event_too_large_to_forward_is_refused_without_closing_subscribers() {
+    let bus = start(with_small_frames());
+    let name = "t".repeat(200);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register(&name, &[], &[]).await;
+    let mut subscriber = Peer::connect(&bus, anyone()).await;
+    subscriber.send(subscribe(1, &name, "*")).await;
+    assert_eq!(subscriber.recv().await, Frame::Accepted { id: 1 });
+
+    let emit = Frame::Emit {
+        event: "event".into(),
+        payload: vec![0; 900],
+    };
+    assert!(encoded_len(&emit) <= 1024);
+    target.send(emit).await;
+    assert_eq!(expect_error(&mut target).await, ErrorCode::Invalid);
+    subscriber.assert_silent().await;
+    assert!(!subscriber.rx.is_closed());
+
+    target
+        .send(Frame::Emit {
+            event: "event".into(),
+            payload: vec![0; 600],
+        })
+        .await;
+    let event = subscriber.recv().await;
+    assert!(matches!(&event, Frame::Event { payload, .. } if payload.len() == 600));
+    assert!(encoded_len(&event) <= 1024);
+}
+
+#[tokio::test(start_paused = true)]
+async fn responses_that_grow_past_the_frame_limit_fail_instead_of_closing_the_caller() {
+    let bus = start(with_small_frames());
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &["op"], &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+
+    for mode in [Mode::Request, Mode::Stream] {
+        let mut env = envelope(u64::MAX, "t", "op", b"");
+        env.mode = mode;
+        caller.send(Frame::Send(env)).await;
+        let id = expect_deliver(&mut target).await.id;
+        let response = |payload: Vec<u8>| match mode {
+            Mode::Stream => Frame::StreamItem { id, payload },
+            _ => Frame::Reply { id, payload },
+        };
+        let overhead = encoded_len(&response(vec![0; 300])) - 300;
+        let largest = response(vec![0; 1024 - overhead]);
+        assert_eq!(encoded_len(&largest), 1024);
+        target.send(largest).await;
+        assert_eq!(
+            expect_fail(&mut caller).await,
+            (u64::MAX, ErrorCode::TargetFailed)
+        );
+    }
+    assert!(!caller.rx.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_message_too_large_to_relay_is_replaced() {
+    let bus = start(with_small_frames());
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &["op"], &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    caller
+        .send(Frame::Send(envelope(u64::MAX, "t", "op", b"")))
+        .await;
+    let id = expect_deliver(&mut target).await.id;
+    let fail = |message: String| Frame::Fail {
+        id,
+        code: ErrorCode::Rejected,
+        message,
+        retryable: false,
+    };
+    let overhead = encoded_len(&fail("m".repeat(300))) - 300;
+    let largest = fail("m".repeat(1024 - overhead));
+    assert_eq!(encoded_len(&largest), 1024);
+    target.send(largest).await;
+    match caller.recv().await {
+        Frame::Fail {
+            id, code, message, ..
+        } => {
+            assert_eq!((id, code), (u64::MAX, ErrorCode::Rejected));
+            assert!(message.len() < 100, "relayed {} bytes", message.len());
+        }
+        other => panic!("expected fail, got {other:?}"),
+    }
+    assert!(!caller.rx.is_closed());
 }

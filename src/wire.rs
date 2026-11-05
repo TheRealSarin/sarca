@@ -226,6 +226,41 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
     Ok(rmp_serde::from_slice(bytes)?)
 }
 
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn encoded_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, WireError> {
+    let mut counter = ByteCounter(0);
+    rmp_serde::encode::write_named(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+pub(crate) fn max_deliver_len(envelope: &Envelope, target: &str) -> Result<usize, WireError> {
+    let without_payload = Frame::Deliver(Envelope {
+        id: u64::MAX,
+        target: target.to_owned(),
+        action: envelope.action.clone(),
+        caps: envelope.caps.clone(),
+        ttl: u64::MAX,
+        retry: envelope.retry,
+        mode: envelope.mode,
+        payload: Vec::new(),
+    });
+    let payload = encoded_len(serde_bytes::Bytes::new(&envelope.payload))?;
+    let empty_payload = encoded_len(serde_bytes::Bytes::new(&[]))?;
+    Ok(encoded_len(&without_payload)? + payload - empty_payload)
+}
+
 pub(crate) fn validate_shape(bytes: &[u8]) -> Result<(), WireError> {
     // Inspect the structure without allocating Serde's internally tagged content tree.
     let mut nodes = 65_536usize;
@@ -475,6 +510,48 @@ mod tests {
         assert!(!valid_name(""));
         assert!(!valid_name("has space"));
         assert!(!valid_name(&"x".repeat(MAX_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn encoded_len_matches_encode() {
+        let frames = [
+            Frame::Ping { nonce: u64::MAX },
+            Frame::Reply {
+                id: 1,
+                payload: vec![0; 70_000],
+            },
+            Frame::Deliver(sample_envelope()),
+            Frame::Event {
+                target: "game-1".into(),
+                event: "joined".into(),
+                payload: b"bob".to_vec(),
+            },
+        ];
+        for frame in frames {
+            assert_eq!(encoded_len(&frame).unwrap(), encode(&frame).unwrap().len());
+        }
+    }
+
+    #[test]
+    fn max_deliver_len_is_exact_for_the_widest_id_and_ttl() {
+        let name = "n".repeat(MAX_NAME_LEN);
+        for payload_len in [0, 1, 255, 256, 65_535, 65_536] {
+            let envelope = Envelope {
+                payload: vec![1; payload_len],
+                ..sample_envelope()
+            };
+            let delivered = Frame::Deliver(Envelope {
+                id: u64::MAX,
+                target: name.clone(),
+                ttl: u64::MAX,
+                ..envelope.clone()
+            });
+            assert_eq!(
+                max_deliver_len(&envelope, &name).unwrap(),
+                encode(&delivered).unwrap().len(),
+                "payload of {payload_len} bytes"
+            );
+        }
     }
 }
 
