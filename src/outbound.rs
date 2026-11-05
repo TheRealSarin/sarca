@@ -25,6 +25,12 @@ impl ByteBudget {
         self.used.load(Ordering::Acquire)
     }
 
+    fn has_room(&self, bytes: usize) -> bool {
+        self.used()
+            .checked_add(bytes)
+            .is_some_and(|total| total <= self.limit)
+    }
+
     fn try_reserve(&self, bytes: usize) -> bool {
         self.used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -39,15 +45,15 @@ impl ByteBudget {
 }
 
 pub(crate) struct Charge {
-    session: Arc<ByteBudget>,
-    global: Arc<ByteBudget>,
+    budgets: [Arc<ByteBudget>; 3],
     bytes: usize,
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        self.session.release(self.bytes);
-        self.global.release(self.bytes);
+        for budget in &self.budgets {
+            budget.release(self.bytes);
+        }
     }
 }
 
@@ -55,13 +61,13 @@ impl Drop for Charge {
 pub(crate) enum OfferError {
     FramesFull,
     BytesFull,
+    TooLarge,
     Closed,
 }
 
 pub(crate) struct OutboundSender {
     tx: mpsc::Sender<(Frame, Charge)>,
-    session: Arc<ByteBudget>,
-    global: Arc<ByteBudget>,
+    budgets: [Arc<ByteBudget>; 3],
     closed: CancellationToken,
 }
 
@@ -75,20 +81,33 @@ impl OutboundSender {
             TrySendError::Full(()) => OfferError::FramesFull,
             TrySendError::Closed(()) => OfferError::Closed,
         })?;
-        if !self.session.try_reserve(bytes) {
-            return Err(OfferError::BytesFull);
+        if !self.fits(bytes) {
+            return Err(OfferError::TooLarge);
         }
-        if !self.global.try_reserve(bytes) {
-            self.session.release(bytes);
-            return Err(OfferError::BytesFull);
+        for (reserved, budget) in self.budgets.iter().enumerate() {
+            if !budget.try_reserve(bytes) {
+                for earlier in &self.budgets[..reserved] {
+                    earlier.release(bytes);
+                }
+                return Err(OfferError::BytesFull);
+            }
         }
         let charge = Charge {
-            session: self.session.clone(),
-            global: self.global.clone(),
+            budgets: self.budgets.clone(),
             bytes,
         };
         permit.send((build(), charge));
         Ok(())
+    }
+
+    pub(crate) fn fits(&self, bytes: usize) -> bool {
+        self.budgets.iter().all(|budget| bytes <= budget.limit)
+    }
+
+    pub(crate) fn has_room(&self, bytes: usize) -> bool {
+        !self.tx.is_closed()
+            && self.tx.capacity() > 0
+            && self.budgets.iter().all(|budget| budget.has_room(bytes))
     }
 
     pub(crate) fn close(&self) {
@@ -130,14 +149,14 @@ impl Outbound {
 pub(crate) fn channel(
     slots: usize,
     session_limit: usize,
+    principal: Arc<ByteBudget>,
     global: Arc<ByteBudget>,
 ) -> (OutboundSender, Outbound) {
     let (tx, rx) = mpsc::channel(slots.max(1));
     let closed = CancellationToken::new();
     let sender = OutboundSender {
         tx,
-        session: ByteBudget::new(session_limit),
-        global,
+        budgets: [ByteBudget::new(session_limit), principal, global],
         closed: closed.clone(),
     };
     (sender, Outbound { rx, closed })
@@ -154,8 +173,8 @@ mod tests {
     #[test]
     fn byte_budgets_are_enforced_and_released() {
         let global = ByteBudget::new(250);
-        let (first, mut first_rx) = channel(8, 200, global.clone());
-        let (second, second_rx) = channel(8, 200, global.clone());
+        let (first, mut first_rx) = channel(8, 200, ByteBudget::new(250), global.clone());
+        let (second, second_rx) = channel(8, 200, ByteBudget::new(250), global.clone());
 
         assert_eq!(first.offer(150, ping), Ok(()));
         assert_eq!(first.offer(100, ping), Err(OfferError::BytesFull));
@@ -172,15 +191,31 @@ mod tests {
 
     #[test]
     fn frame_slots_are_enforced_without_building_the_frame() {
-        let (sender, _rx) = channel(1, 1_000, ByteBudget::new(1_000));
+        let (sender, _rx) = channel(1, 1_000, ByteBudget::new(1_000), ByteBudget::new(1_000));
         assert_eq!(sender.offer(1, ping), Ok(()));
         let result = sender.offer(1, || panic!("frame built despite a full queue"));
         assert_eq!(result, Err(OfferError::FramesFull));
+        assert!(!sender.has_room(1));
+    }
+
+    #[test]
+    fn principal_budget_is_shared_and_rolled_back() {
+        let global = ByteBudget::new(1_000);
+        let principal = ByteBudget::new(150);
+        let (first, _first_rx) = channel(8, 100, principal.clone(), global.clone());
+        let (second, _second_rx) = channel(8, 100, principal.clone(), global.clone());
+        assert_eq!(first.offer(100, ping), Ok(()));
+        assert!(!second.has_room(100));
+        assert_eq!(second.offer(100, ping), Err(OfferError::BytesFull));
+        assert_eq!(global.used(), 100);
+        assert_eq!(principal.used(), 100);
+        assert!(second.has_room(50));
+        assert_eq!(second.offer(101, ping), Err(OfferError::TooLarge));
     }
 
     #[test]
     fn close_signals_the_receiver() {
-        let (sender, rx) = channel(1, 1, ByteBudget::new(1));
+        let (sender, rx) = channel(1, 1, ByteBudget::new(1), ByteBudget::new(1));
         assert!(!rx.is_closed());
         sender.close();
         assert!(rx.is_closed());
@@ -193,7 +228,7 @@ mod regression_tests {
     #[tokio::test]
     async fn writer_holds_charge_until_send_finishes() {
         let budget = ByteBudget::new(100);
-        let (sender, mut receiver) = channel(2, 100, budget.clone());
+        let (sender, mut receiver) = channel(2, 100, ByteBudget::new(100), budget.clone());
         sender.offer(100, || Frame::Ping { nonce: 1 }).unwrap();
         let (frame, charge) = receiver.recv_charged().await.unwrap();
         assert_eq!(budget.used(), 100);

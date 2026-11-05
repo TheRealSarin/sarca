@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -12,7 +12,8 @@ use crate::footprint;
 use crate::hooks::{Hook, HookContext, LoggingHook, Operation, RateLimitHook};
 use crate::outbound::{self, ByteBudget, OfferError, Outbound, OutboundSender};
 use crate::wire::{
-    ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, Mode, TargetInfo, valid_name,
+    ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, MAX_NAME_LEN, Mode, TargetInfo,
+    valid_name,
 };
 
 pub type SessionId = u64;
@@ -21,6 +22,7 @@ const MAX_ACTIONS: usize = 1024;
 const MAX_GROUPS: usize = 64;
 const MAX_CAPS: usize = 64;
 const WILDCARD: &str = "*";
+const DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 
 type Failure = (ErrorCode, String);
 
@@ -46,20 +48,31 @@ pub struct BusHandle {
     next_session: Arc<AtomicU64>,
     session_buffer: usize,
     outbound_session_bytes: usize,
+    outbound_principal_bytes: usize,
+    outbound_principals: Arc<Mutex<HashMap<String, Arc<ByteBudget>>>>,
     outbound_bytes: Arc<ByteBudget>,
     ingress: Arc<Semaphore>,
+    ingress_bytes: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("bus unavailable or ingress byte limit exceeded")]
+#[error("bus unavailable")]
 pub struct BusClosed;
 
 impl BusHandle {
     pub async fn connect(&self, principal: Principal) -> Result<(SessionId, Outbound), BusClosed> {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        let principal_budget = self
+            .outbound_principals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(principal.name.clone())
+            .or_insert_with(|| ByteBudget::new(self.outbound_principal_bytes))
+            .clone();
         let (out, rx) = outbound::channel(
             self.session_buffer,
             self.outbound_session_bytes,
+            principal_budget,
             self.outbound_bytes.clone(),
         );
         self.tx
@@ -74,11 +87,13 @@ impl BusHandle {
     }
 
     pub async fn frame(&self, session: SessionId, frame: Frame) -> Result<(), BusClosed> {
-        let bytes = u32::try_from(footprint::frame_bytes(&frame)).map_err(|_| BusClosed)?;
+        let bytes = footprint::frame_bytes(&frame).min(self.ingress_bytes);
+        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
         let charge = self
             .ingress
             .clone()
-            .try_acquire_many_owned(bytes)
+            .acquire_many_owned(bytes)
+            .await
             .map_err(|_| BusClosed)?;
         self.tx
             .send(BusEvent::Frame {
@@ -126,6 +141,12 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
         pending_bytes: 0,
         target_bytes: 0,
         kicks: Vec::new(),
+        drains: HashSet::new(),
+        outbound_fit: config
+            .limits
+            .max_outbound_bytes_per_session
+            .min(config.limits.max_outbound_bytes_per_principal)
+            .min(config.limits.max_outbound_bytes),
         next_id: 1,
         next_timer: 0,
     };
@@ -135,8 +156,11 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
         next_session: Arc::new(AtomicU64::new(1)),
         session_buffer: config.limits.session_buffer.max(1),
         outbound_session_bytes: config.limits.max_outbound_bytes_per_session,
+        outbound_principal_bytes: config.limits.max_outbound_bytes_per_principal,
+        outbound_principals: Arc::new(Mutex::new(HashMap::new())),
         outbound_bytes: ByteBudget::new(config.limits.max_outbound_bytes),
         ingress: Arc::new(Semaphore::new(config.limits.max_pending_bytes)),
+        ingress_bytes: config.limits.max_pending_bytes,
     }
 }
 
@@ -198,6 +222,7 @@ struct Pending {
     max_attempts: u32,
     deadline: Instant,
     expire_key: (Instant, u64),
+    retry_key: Option<(Instant, u64)>,
     streamed: bool,
     acknowledged: bool,
     stage: Stage,
@@ -207,12 +232,19 @@ enum Timer {
     Expire(u64),
     Retry(u64),
     Forget(String),
+    Drain(String),
 }
 
 enum Route {
     Online(SessionId, String),
+    Busy,
     Offline,
     Reject(ErrorCode, String),
+}
+
+enum Attempt {
+    Done(bool),
+    Wait { busy: bool },
 }
 
 struct Bus {
@@ -230,6 +262,8 @@ struct Bus {
     pending_bytes: usize,
     target_bytes: usize,
     kicks: Vec<SessionId>,
+    drains: HashSet<String>,
+    outbound_fit: usize,
     next_id: u64,
     next_timer: u64,
 }
@@ -425,12 +459,19 @@ impl Bus {
             match timer {
                 Timer::Expire(id) => self.fail(id, ErrorCode::Expired, "ttl expired".into()),
                 Timer::Forget(name) => self.forget_target(&name, key),
+                Timer::Drain(name) => {
+                    self.drains.remove(&name);
+                    self.drain_queue(&name);
+                }
                 Timer::Retry(id) => {
-                    if self
-                        .pending
-                        .get(&id)
-                        .is_some_and(|p| p.stage == Stage::Waiting)
-                    {
+                    let Some(pending) = self.pending.get_mut(&id) else {
+                        continue;
+                    };
+                    if pending.retry_key != Some(key) {
+                        continue;
+                    }
+                    pending.retry_key = None;
+                    if pending.stage == Stage::Waiting {
                         self.dispatch(id);
                     }
                 }
@@ -517,6 +558,9 @@ impl Bus {
             hook.on_send(&ctx, envelope)
                 .map_err(|rejection| (rejection.code, rejection.message))?;
         }
+        if footprint::delivery_bytes(envelope, "") + MAX_NAME_LEN > self.outbound_fit {
+            return Err((ErrorCode::Invalid, "message is too large to deliver".into()));
+        }
         self.check_pending_quota(&caller.owner, retained_bytes(envelope))
     }
 
@@ -572,6 +616,7 @@ impl Bus {
                 max_attempts,
                 deadline,
                 expire_key,
+                retry_key: None,
                 streamed: false,
                 acknowledged: false,
                 stage: Stage::Waiting,
@@ -595,20 +640,53 @@ impl Bus {
             return false;
         };
         let key = pending.envelope.target.clone();
+        if self.queues.get(&key).is_some_and(|queue| !queue.is_empty()) {
+            return self.enqueue_waiting(id, key, true);
+        }
+        match self.attempt(id) {
+            Attempt::Done(accepted) => accepted,
+            Attempt::Wait { busy } => self.enqueue_waiting(id, key, busy),
+        }
+    }
+
+    fn enqueue_waiting(&mut self, id: u64, key: String, drain: bool) -> bool {
+        if !self.enqueue(id, key.clone()) {
+            return false;
+        }
+        if drain {
+            self.schedule_drain(key);
+        }
+        true
+    }
+
+    fn schedule_drain(&mut self, key: String) {
+        if self.drains.insert(key.clone()) {
+            self.add_timer(Instant::now() + DRAIN_INTERVAL, Timer::Drain(key));
+        }
+    }
+
+    fn attempt(&mut self, id: u64) -> Attempt {
+        let Some(pending) = self.pending.get(&id) else {
+            return Attempt::Done(false);
+        };
+        let key = pending.envelope.target.clone();
         let action = pending.envelope.action.clone();
-        match self.resolve(&key, &action) {
+        let base = footprint::delivery_bytes(&pending.envelope, "");
+        let caller = pending.caller;
+        match self.resolve(&key, &action, base, caller) {
             Route::Online(session, name) => self.deliver(id, session, &name),
-            Route::Offline => self.enqueue(id, key),
+            Route::Busy => Attempt::Wait { busy: true },
+            Route::Offline => Attempt::Wait { busy: false },
             Route::Reject(code, message) => {
                 self.fail(id, code, message);
-                false
+                Attempt::Done(false)
             }
         }
     }
 
-    fn deliver(&mut self, id: u64, session: SessionId, name: &str) -> bool {
-        let Some(pending) = self.pending.get_mut(&id) else {
-            return false;
+    fn deliver(&mut self, id: u64, session: SessionId, name: &str) -> Attempt {
+        let Some(pending) = self.pending.get(&id) else {
+            return Attempt::Done(false);
         };
         let required = self
             .targets
@@ -622,29 +700,52 @@ impl Bus {
         {
             let message = format!("action requires capability '{cap}'");
             self.fail(id, ErrorCode::Forbidden, message);
-            return false;
+            return Attempt::Done(false);
         }
-
-        let mut envelope = pending.envelope.clone();
-        envelope.id = id;
-        envelope.target = name.to_string();
+        let Some(target) = self.sessions.get(&session) else {
+            return Attempt::Wait { busy: true };
+        };
+        let bytes = footprint::delivery_bytes(&pending.envelope, name);
         let remaining = pending.deadline.saturating_duration_since(Instant::now());
-        envelope.ttl = u64::try_from(remaining.as_millis())
+        let ttl = u64::try_from(remaining.as_millis())
             .unwrap_or(u64::MAX)
             .max(1);
+        let offered = target.out.offer(bytes, || {
+            let mut envelope = pending.envelope.clone();
+            envelope.id = id;
+            envelope.target = name.to_string();
+            envelope.ttl = ttl;
+            Frame::Deliver(envelope)
+        });
+        match offered {
+            Ok(()) => {}
+            Err(OfferError::FramesFull | OfferError::BytesFull) => {
+                return Attempt::Wait { busy: true };
+            }
+            Err(OfferError::Closed) => {
+                self.kicks.push(session);
+                return Attempt::Wait { busy: true };
+            }
+            Err(OfferError::TooLarge) => {
+                self.fail(
+                    id,
+                    ErrorCode::Invalid,
+                    "message is too large to deliver".into(),
+                );
+                return Attempt::Done(false);
+            }
+        }
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return Attempt::Done(false);
+        };
         pending.attempts += 1;
         pending.stage = Stage::InFlight(session);
-        let mode = envelope.mode;
-
-        if !self.send_to(session, Frame::Deliver(envelope)) {
-            return self.retry_or_fail(id, ErrorCode::Unavailable, "target unreachable".into());
-        }
-        if mode == Mode::Fire {
+        if pending.envelope.mode == Mode::Fire {
             self.finish(id);
         } else if let Some(target) = self.sessions.get_mut(&session) {
             target.inflight.insert(id);
         }
-        true
+        Attempt::Done(true)
     }
 
     fn enqueue(&mut self, id: u64, key: String) -> bool {
@@ -664,24 +765,40 @@ impl Bus {
         true
     }
 
-    fn resolve(&mut self, key: &str, action: &str) -> Route {
-        match self.resolve_direct(key, action) {
+    fn resolve(&mut self, key: &str, action: &str, base: usize, caller: SessionId) -> Route {
+        match self.resolve_direct(key, action, base) {
             Route::Offline => {
                 let backups = self.rules.get(key).cloned().unwrap_or_default();
+                let mut busy = false;
                 for backup in backups {
-                    if let Route::Online(session, name) = self.resolve_direct(&backup, action) {
-                        return Route::Online(session, name);
+                    let allowed = self
+                        .sessions
+                        .get(&caller)
+                        .is_some_and(|entry| entry.principal.may_address(&backup));
+                    if !allowed {
+                        continue;
+                    }
+                    match self.resolve_direct(&backup, action, base) {
+                        route @ Route::Online(..) => return route,
+                        Route::Busy => busy = true,
+                        Route::Offline | Route::Reject(..) => {}
                     }
                 }
-                Route::Offline
+                if busy { Route::Busy } else { Route::Offline }
             }
             route => route,
         }
     }
 
-    fn resolve_direct(&mut self, key: &str, action: &str) -> Route {
+    fn has_room(&self, session: SessionId, bytes: usize) -> bool {
+        self.sessions
+            .get(&session)
+            .is_some_and(|entry| entry.out.has_room(bytes))
+    }
+
+    fn resolve_direct(&mut self, key: &str, action: &str, base: usize) -> Route {
         if let Some(group_name) = key.strip_prefix(GROUP_PREFIX) {
-            let Some(group) = self.groups.get_mut(group_name) else {
+            let Some(group) = self.groups.get(group_name) else {
                 return Route::Offline;
             };
             let mut online_members = 0;
@@ -708,9 +825,18 @@ impl Bus {
                     Route::Offline
                 };
             }
-            let (name, session) = candidates[group.cursor % candidates.len()];
-            let name = name.clone();
-            group.cursor = group.cursor.wrapping_add(1);
+            let start = group.cursor;
+            let chosen = (0..candidates.len()).find_map(|offset| {
+                let (name, session) = candidates[start.wrapping_add(offset) % candidates.len()];
+                self.has_room(session, base + name.len())
+                    .then(|| (offset, session, name.clone()))
+            });
+            let Some((offset, session, name)) = chosen else {
+                return Route::Busy;
+            };
+            if let Some(group) = self.groups.get_mut(group_name) {
+                group.cursor = start.wrapping_add(offset).wrapping_add(1);
+            }
             return Route::Online(session, name);
         }
 
@@ -721,7 +847,10 @@ impl Bus {
                 format!("'{key}' does not support '{action}'"),
             ),
             Some(entry) => match entry.session {
-                Some(session) => Route::Online(session, key.to_string()),
+                Some(session) if self.has_room(session, base + key.len()) => {
+                    Route::Online(session, key.to_string())
+                }
+                Some(_) => Route::Busy,
                 None => Route::Offline,
             },
         }
@@ -730,6 +859,9 @@ impl Bus {
     fn finish(&mut self, id: u64) -> Option<Pending> {
         let pending = self.pending.remove(&id)?;
         self.timers.remove(&pending.expire_key);
+        if let Some(key) = pending.retry_key {
+            self.timers.remove(&key);
+        }
         match &pending.stage {
             Stage::InFlight(session) => {
                 if let Some(target) = self.sessions.get_mut(session) {
@@ -762,7 +894,7 @@ impl Bus {
             return;
         };
         if pending.envelope.mode == Mode::Fire && pending.acknowledged {
-            tracing::debug!(id, ?code, %message, "fire-and-forget message dropped");
+            tracing::debug!(id, ?code, ?message, "fire-and-forget message dropped");
             return;
         }
         self.send_to(
@@ -797,11 +929,24 @@ impl Bus {
             .saturating_mul(1u64 << exponent)
             .min(self.limits.max_backoff_ms);
         pending.stage = Stage::Waiting;
-        tracing::debug!(id, attempts = pending.attempts, delay_ms, %message, "retrying");
-        self.add_timer(
+        let previous = pending.retry_key.take();
+        tracing::debug!(
+            id,
+            attempts = pending.attempts,
+            delay_ms,
+            ?message,
+            "retrying"
+        );
+        if let Some(previous) = previous {
+            self.timers.remove(&previous);
+        }
+        let key = self.add_timer(
             Instant::now() + Duration::from_millis(delay_ms),
             Timer::Retry(id),
         );
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.retry_key = Some(key);
+        }
         true
     }
 
@@ -1047,11 +1192,35 @@ impl Bus {
         let Some(queue) = self.queues.remove(key) else {
             return;
         };
-        for id in queue {
+        let mut kept = VecDeque::new();
+        let mut busy = false;
+        let mut items = queue.into_iter();
+        while let Some(id) = items.next() {
+            let Some(pending) = self.pending.get_mut(&id) else {
+                continue;
+            };
+            pending.stage = Stage::Waiting;
+            let Attempt::Wait { busy: full } = self.attempt(id) else {
+                continue;
+            };
             if let Some(pending) = self.pending.get_mut(&id) {
-                pending.stage = Stage::Waiting;
-                self.dispatch(id);
+                pending.stage = Stage::Queued(key.to_string());
+                kept.push_back(id);
             }
+            if full {
+                busy = true;
+                kept.extend(items.by_ref().filter(|id| self.pending.contains_key(id)));
+                break;
+            }
+        }
+        if let Some(newer) = self.queues.remove(key) {
+            kept.extend(newer);
+        }
+        if !kept.is_empty() {
+            self.queues.insert(key.to_string(), kept);
+        }
+        if busy {
+            self.schedule_drain(key.to_string());
         }
     }
 
@@ -1281,12 +1450,28 @@ mod ingress_tests {
             next_session: Arc::new(AtomicU64::new(1)),
             session_buffer: 1,
             outbound_session_bytes: 1024,
+            outbound_principal_bytes: 1024,
+            outbound_principals: Arc::new(Mutex::new(HashMap::new())),
             outbound_bytes: ByteBudget::new(1024),
             ingress: Arc::new(Semaphore::new(bytes)),
+            ingress_bytes: bytes,
         };
         handle.frame(1, Frame::Ping { nonce: 0 }).await.unwrap();
-        assert!(handle.frame(1, Frame::Ping { nonce: 1 }).await.is_err());
+        let second = handle.frame(1, Frame::Ping { nonce: 1 });
+        tokio::pin!(second);
+        let waited = tokio::time::timeout(Duration::from_millis(20), &mut second).await;
+        assert!(
+            waited.is_err(),
+            "second frame should wait for ingress budget"
+        );
         drop(rx.recv().await.unwrap());
-        handle.frame(1, Frame::Ping { nonce: 2 }).await.unwrap();
+        second.await.unwrap();
+        drop(rx.recv().await.unwrap());
+        let big = Frame::Emit {
+            event: "e".into(),
+            payload: vec![0; 4 * bytes],
+        };
+        handle.frame(1, big).await.unwrap();
+        drop(rx.recv().await.unwrap());
     }
 }

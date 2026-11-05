@@ -16,6 +16,10 @@ pub(crate) fn envelope_bytes(envelope: &Envelope) -> usize {
         + envelope.payload.len()
 }
 
+pub(crate) fn delivery_bytes(envelope: &Envelope, target: &str) -> usize {
+    size_of::<Frame>() + envelope_bytes(envelope) - envelope.target.len() + target.len()
+}
+
 pub(crate) fn actions_bytes(actions: &[ActionSpec]) -> usize {
     actions
         .iter()
@@ -73,6 +77,26 @@ pub(crate) fn registration_bytes(target: &str, actions: &[ActionSpec], groups: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_bytes_match_the_delivered_frame() {
+        let envelope = Envelope {
+            id: 1,
+            target: "group:games".into(),
+            action: "a".into(),
+            caps: vec!["c".into()],
+            ttl: 0,
+            retry: Default::default(),
+            mode: Default::default(),
+            payload: vec![0; 10],
+        };
+        let mut delivered = envelope.clone();
+        delivered.target = "game-1".into();
+        assert_eq!(
+            delivery_bytes(&envelope, "game-1"),
+            frame_bytes(&Frame::Deliver(delivered))
+        );
+    }
 
     #[test]
     fn empty_strings_still_cost_their_containers() {

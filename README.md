@@ -74,11 +74,17 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
     offline targets. Re-registering a name you already own is always allowed.
   - `max_target_bytes` / `max_target_bytes_per_principal`: estimated memory
     held by registrations (names, actions, capability lists, groups).
-  - `max_outbound_bytes_per_session` / `max_outbound_bytes`: estimated bytes
-    waiting to be written to one connection, and to all of them. A session
-    that would exceed either (a slow reader, typically) is closed, the same as
-    when its `session_buffer` frame slots run out. The per-session budget must
-    be at least `max_frame_bytes`.
+  - `max_outbound_bytes_per_session` / `max_outbound_bytes_per_principal` /
+    `max_outbound_bytes`: estimated bytes waiting to be written to one
+    connection, to all connections of one principal, and to all of them. A
+    reply, stream item or event that would exceed any of them (a slow reader,
+    typically) closes the receiving session, the same as when its
+    `session_buffer` frame slots run out. Deliveries to a target never close
+    it: when the target has no room they wait in its queue and are retried
+    shortly. The per-session budget must be at least `max_frame_bytes` and
+    must not exceed the per-principal budget, which must not exceed the
+    total. A request too large to ever fit a session budget is refused with
+    `invalid`.
   - `max_connections`: connections served at once across all listeners,
     including ones still handshaking. Further connections wait in the
     listen backlog until a slot frees up.
@@ -97,8 +103,9 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
 - `log_messages`: log routing metadata for every send (never payloads).
   Unexpected frames are logged by frame type only, never their contents.
 - `[[rules]]`: `when_down = "name"`, `route_to = ["backup", "group:pool"]`.
-  Backups are tried in order when the primary is offline; otherwise the message
-  queues for the primary and is flushed when it, or a backup, registers.
+  Backups are tried in order when the primary is offline, skipping any backup
+  the sender's `send` grant does not cover; otherwise the message queues for
+  the primary and is flushed when it, or a backup, registers.
 
 ### Grants
 
@@ -129,7 +136,8 @@ verified the caller holds every claimed capability. Targets receive the verified
 - A stream that has already forwarded an item is never retried.
 - Fire-and-forget gets an `accepted` reply once the bus has delivered or queued
   it. Later failures (expiry, full queue on retry) are logged, not reported.
-- `group:<name>` round-robins across online members that support the action.
+- `group:<name>` round-robins across online members that support the action,
+  skipping members with no outbound room.
 - Sends beyond a principal's pending quota fail with `quota_exceeded`; beyond
   the bus-wide totals, with `overloaded`. Both are marked retryable. The same
   codes apply to subscription and registration quotas.
@@ -253,8 +261,8 @@ logging. Hooks run on the bus task, so they must be fast and must not block.
 ## Resource and failure boundaries
 
 Incoming decoded frames waiting for the bus have a separate aggregate byte
-budget equal to `max_pending_bytes`. A connection exceeding this ingress
-budget is closed rather than allowed to accumulate more frames. Network frame
+budget equal to `max_pending_bytes`. When it is spent, connections stop
+reading until the bus catches up; no connection is closed for it. Network frame
 buffers remain bounded by `max_frame_bytes` and `max_connections`; the ingress
 budget is not a total process-memory limit.
 

@@ -990,3 +990,162 @@ async fn oversized_listing_returns_error_without_disconnecting() {
     caller.send(Frame::Ping { nonce: 42 }).await;
     assert_eq!(caller.recv().await, Frame::Pong { nonce: 42 });
 }
+
+#[tokio::test(start_paused = true)]
+async fn backlog_larger_than_the_session_buffer_drains_in_order() {
+    let mut config = Config::default();
+    config.limits.session_buffer = 4;
+    config.limits.max_queue_per_target = 10;
+    let bus = start(config);
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    for id in 0..10u8 {
+        caller
+            .send(Frame::Send(envelope(id.into(), "t", "op", &[id])))
+            .await;
+    }
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &["op"], &[]).await;
+    for id in 0..10u8 {
+        let delivered = expect_deliver(&mut target).await;
+        assert_eq!(delivered.payload, [id]);
+        target
+            .send(Frame::Reply {
+                id: delivered.id,
+                payload: vec![id],
+            })
+            .await;
+        assert_eq!(
+            caller.recv().await,
+            Frame::Reply {
+                id: id.into(),
+                payload: vec![id],
+            }
+        );
+    }
+    assert!(!target.rx.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn burst_beyond_a_live_target_buffer_waits_instead_of_closing_it() {
+    let mut config = Config::default();
+    config.limits.session_buffer = 2;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &["op"], &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    for id in 0..6u8 {
+        caller
+            .send(Frame::Send(envelope(id.into(), "t", "op", &[id])))
+            .await;
+    }
+    caller.assert_silent().await;
+    for id in 0..6u8 {
+        assert_eq!(expect_deliver(&mut target).await.payload, [id]);
+    }
+    assert!(!target.rx.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn group_delivery_skips_a_member_with_no_room() {
+    let mut config = Config::default();
+    config.limits.session_buffer = 1;
+    let bus = start(config);
+    let mut a = Peer::connect(&bus, anyone()).await;
+    a.register("a", &["op"], &["pool"]).await;
+    let mut b = Peer::connect(&bus, anyone()).await;
+    b.register("b", &["op"], &["pool"]).await;
+    let caller = Peer::connect(&bus, anyone()).await;
+
+    caller
+        .send(Frame::Send(envelope(1, "a", "op", b"direct")))
+        .await;
+    caller
+        .send(Frame::Send(envelope(2, "group:pool", "op", b"pooled")))
+        .await;
+    assert_eq!(expect_deliver(&mut b).await.payload, b"pooled");
+    assert_eq!(expect_deliver(&mut a).await.payload, b"direct");
+}
+
+#[tokio::test(start_paused = true)]
+async fn fallback_requires_a_send_grant_for_the_backup() {
+    let config = Config {
+        rules: vec![Rule {
+            when_down: "primary".into(),
+            route_to: vec!["backup".into()],
+        }],
+        ..Config::default()
+    };
+    let bus = start(config);
+    let mut backup = Peer::connect(&bus, anyone()).await;
+    backup.register("backup", &["op"], &[]).await;
+    let narrow = Grant {
+        send: vec!["primary".into()],
+        ..Grant::default()
+    };
+    let mut caller = Peer::connect(&bus, principal("narrow", narrow)).await;
+    caller
+        .send(Frame::Send(envelope(1, "primary", "op", b"kept")))
+        .await;
+    caller.assert_silent().await;
+    backup.assert_silent().await;
+
+    let mut primary = Peer::connect(&bus, anyone()).await;
+    primary.register("primary", &["op"], &[]).await;
+    assert_eq!(expect_deliver(&mut primary).await.payload, b"kept");
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbound_budget_is_shared_by_a_principal_sessions() {
+    let mut config = Config::default();
+    config.limits.max_outbound_bytes_per_session = 4_096;
+    config.limits.max_outbound_bytes_per_principal = 2_500;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &[], &[]).await;
+    let mut slow = Vec::new();
+    for _ in 0..2 {
+        let mut peer = Peer::connect(&bus, principal("slow", Grant::everything())).await;
+        peer.send(subscribe(1, "t", "*")).await;
+        assert_eq!(peer.recv().await, Frame::Accepted { id: 1 });
+        slow.push(peer);
+    }
+    let mut other = Peer::connect(&bus, principal("other", Grant::everything())).await;
+    other.send(subscribe(1, "t", "*")).await;
+    assert_eq!(other.recv().await, Frame::Accepted { id: 1 });
+
+    for _ in 0..2 {
+        target
+            .send(Frame::Emit {
+                event: "blob".into(),
+                payload: vec![0; 1_000],
+            })
+            .await;
+    }
+    target.send(Frame::Ping { nonce: 1 }).await;
+    assert_eq!(target.recv().await, Frame::Pong { nonce: 1 });
+
+    for peer in &mut slow {
+        assert!(peer.rx.is_closed());
+        assert!(matches!(peer.rx.recv().await, Some(Frame::Event { .. })));
+        assert!(peer.rx.recv().await.is_none());
+    }
+    for _ in 0..2 {
+        assert!(matches!(other.recv().await, Frame::Event { .. }));
+    }
+    assert!(!other.rx.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn message_that_can_never_fit_a_session_is_rejected() {
+    let mut config = Config::default();
+    config.limits.max_outbound_bytes_per_session = 4_096;
+    let bus = start(config);
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("t", &["op"], &[]).await;
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    caller
+        .send(Frame::Send(envelope(1, "t", "op", &[0; 4_000])))
+        .await;
+    assert_eq!(expect_fail(&mut caller).await, (1, ErrorCode::Invalid));
+    target.assert_silent().await;
+}
