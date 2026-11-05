@@ -76,12 +76,25 @@ async fn echo(call: Call) {
         "boom" => {
             let _ = call.fail(ErrorCode::TargetFailed, "exploded", false).await;
         }
+        "hang" => {
+            let _call = call;
+            std::future::pending::<()>().await;
+        }
+        "flood" => {
+            let mut call = call;
+            for i in 0..1_000u32 {
+                if call.stream_item(i.to_be_bytes().to_vec()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = call.end().await;
+        }
         _ => {}
     }
 }
 
 fn echo_actions() -> Vec<ActionSpec> {
-    ["echo", "count", "boom", "note"]
+    ["echo", "count", "boom", "note", "hang", "flood"]
         .into_iter()
         .map(ActionSpec::new)
         .collect()
@@ -358,4 +371,94 @@ fn example_config_is_valid_once_hashes_are_filled_in() {
 
     let unfilled: Config = toml::from_str(&text).unwrap();
     assert!(unfilled.validate().is_err());
+}
+
+#[tokio::test]
+async fn target_rejects_deliveries_beyond_its_handler_limit() {
+    let server = start(Config::default(), false).await;
+    let mut config = TargetConfig::new(&server.tcp, "busy", echo_actions());
+    config.max_concurrent = 1;
+    let target = spawn_target(config);
+    let client = Client::connect(&server.tcp, None).await.unwrap();
+    wait_for_target(&client, "busy").await;
+
+    let short = SendOptions {
+        ttl: Some(Duration::from_millis(300)),
+        ..SendOptions::default()
+    };
+    let hung = {
+        let client = client.clone();
+        let short = short.clone();
+        tokio::spawn(async move { client.request("busy", "hang", Vec::new(), &short).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let err = client
+        .request("busy", "echo", b"x".to_vec(), &SendOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ClientError::Remote(e) if e.code == ErrorCode::Overloaded));
+
+    let err = hung.await.unwrap().unwrap_err();
+    assert!(matches!(err, ClientError::Remote(e) if e.code == ErrorCode::Expired));
+    let reply = tokio::time::timeout(WAIT, async {
+        loop {
+            match client
+                .request("busy", "echo", b"back".to_vec(), &SendOptions::default())
+                .await
+            {
+                Ok(reply) => return reply,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("timed-out handler never released its slot");
+    assert_eq!(reply, b"back");
+
+    target.abort();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn stalled_stream_does_not_block_other_replies() {
+    let server = start(Config::default(), false).await;
+    let target = spawn_target(TargetConfig::new(&server.tcp, "firehose", echo_actions()));
+    let client = Client::connect(&server.tcp, None).await.unwrap();
+    wait_for_target(&client, "firehose").await;
+    let opts = SendOptions::default();
+
+    let mut items = client
+        .stream("firehose", "flood", Vec::new(), &opts)
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        while items.len() < 257 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("stream never filled its buffer");
+
+    let reply = tokio::time::timeout(
+        WAIT,
+        client.request("firehose", "echo", b"hi".to_vec(), &opts),
+    )
+    .await
+    .expect("reply blocked behind a stalled stream")
+    .unwrap();
+    assert_eq!(reply, b"hi");
+
+    let mut received = 0;
+    let mut terminal = None;
+    while let Some(item) = items.recv().await {
+        match item {
+            Ok(_) => received += 1,
+            Err(err) => terminal = Some(err.code),
+        }
+    }
+    assert_eq!(received, 256);
+    assert_eq!(terminal, Some(ErrorCode::Overloaded));
+
+    target.abort();
+    server.stop().await;
 }

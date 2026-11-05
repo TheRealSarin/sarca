@@ -95,6 +95,8 @@ pub enum ErrorCode {
     Expired,
     Unavailable,
     TargetFailed,
+    Overloaded,
+    QuotaExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +180,33 @@ pub enum Frame {
     Pong {
         nonce: u64,
     },
+}
+
+impl Frame {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Hello { .. } => "hello",
+            Frame::Welcome { .. } => "welcome",
+            Frame::Register { .. } => "register",
+            Frame::Registered { .. } => "registered",
+            Frame::Send(_) => "send",
+            Frame::Deliver(_) => "deliver",
+            Frame::Accepted { .. } => "accepted",
+            Frame::Reply { .. } => "reply",
+            Frame::StreamItem { .. } => "stream_item",
+            Frame::StreamEnd { .. } => "stream_end",
+            Frame::Fail { .. } => "fail",
+            Frame::Subscribe { .. } => "subscribe",
+            Frame::Unsubscribe { .. } => "unsubscribe",
+            Frame::Emit { .. } => "emit",
+            Frame::Event { .. } => "event",
+            Frame::ListTargets { .. } => "list_targets",
+            Frame::Targets { .. } => "targets",
+            Frame::Error { .. } => "error",
+            Frame::Ping { .. } => "ping",
+            Frame::Pong { .. } => "pong",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -315,6 +344,33 @@ mod tests {
         assert_eq!(env.ttl, 0);
         assert!(env.caps.is_empty());
         assert!(env.payload.is_empty());
+    }
+
+    #[test]
+    fn frame_kind_matches_wire_tag_without_exposing_contents() {
+        let frames = [
+            Frame::Hello {
+                client: "cli".into(),
+                token: Some("secret".into()),
+            },
+            Frame::Deliver(sample_envelope()),
+            Frame::StreamItem {
+                id: 1,
+                payload: b"private".to_vec(),
+            },
+            Frame::ListTargets { id: 1 },
+        ];
+        for frame in frames {
+            let tag: RawTag = rmp_serde::from_slice(&encode(&frame).unwrap()).unwrap();
+            assert_eq!(frame.kind(), tag.kind);
+            assert!(!frame.kind().contains("secret") && !frame.kind().contains("private"));
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct RawTag {
+        #[serde(rename = "type")]
+        kind: String,
     }
 
     #[test]

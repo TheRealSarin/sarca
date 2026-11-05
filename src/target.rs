@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use crate::client::{ClientError, RemoteError, open_link, spawn_writer};
 use crate::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode};
@@ -33,7 +34,10 @@ pub struct TargetConfig {
     pub rules: Vec<LocalRule>,
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
+    pub max_concurrent: usize,
 }
+
+pub const DEFAULT_MAX_CONCURRENT: usize = 64;
 
 impl TargetConfig {
     pub fn new(url: impl Into<String>, name: impl Into<String>, actions: Vec<ActionSpec>) -> Self {
@@ -46,6 +50,7 @@ impl TargetConfig {
             rules: Vec::new(),
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(30),
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
         }
     }
 }
@@ -68,6 +73,7 @@ pub struct Call {
     envelope: Envelope,
     out: Option<mpsc::Sender<Frame>>,
     answered: bool,
+    deadline: Option<Instant>,
 }
 
 impl Call {
@@ -85,6 +91,7 @@ impl Call {
             },
             out: None,
             answered: false,
+            deadline: None,
         }
     }
 
@@ -162,11 +169,19 @@ impl Drop for Call {
         if self.answered || self.envelope.mode == Mode::Fire {
             return;
         }
+        let expired = self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        let (code, message) = if expired {
+            (ErrorCode::Expired, "handler did not finish within the ttl")
+        } else {
+            (ErrorCode::TargetFailed, "handler finished without replying")
+        };
         if let Some(out) = &self.out {
             let _ = out.try_send(Frame::Fail {
                 id: self.envelope.id,
-                code: ErrorCode::TargetFailed,
-                message: "handler finished without replying".into(),
+                code,
+                message: message.into(),
                 retryable: false,
             });
         }
@@ -292,9 +307,17 @@ impl Target {
         .await
         .map_err(|_| ClientError::Disconnected)?;
 
+        let permits = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
+        let mut handlers = JoinSet::new();
         let mut registered = false;
-        while let Some(item) = stream.next().await {
-            let Ok(frame) = item else { break };
+        loop {
+            let frame = tokio::select! {
+                item = stream.next() => match item {
+                    Some(Ok(frame)) => frame,
+                    _ => break,
+                },
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => continue,
+            };
             match frame {
                 Frame::Registered { .. } => {
                     registered = true;
@@ -304,13 +327,37 @@ impl Target {
                         .await;
                 }
                 Frame::Deliver(envelope) => {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        tracing::warn!(
+                            target = %config.name,
+                            id = envelope.id,
+                            action = %envelope.action,
+                            "concurrent handler limit reached, rejecting delivery"
+                        );
+                        if envelope.mode != Mode::Fire {
+                            let _ = out
+                                .send(Frame::Fail {
+                                    id: envelope.id,
+                                    code: ErrorCode::Overloaded,
+                                    message: "target is at its concurrent handler limit".into(),
+                                    retryable: true,
+                                })
+                                .await;
+                        }
+                        continue;
+                    };
+                    let deadline = Instant::now() + Duration::from_millis(envelope.ttl.max(1));
                     let call = Call {
                         envelope,
                         out: Some(out.clone()),
                         answered: false,
+                        deadline: Some(deadline),
                     };
                     let handler = handler.clone();
-                    tokio::spawn(async move { handler.call(call).await });
+                    handlers.spawn(async move {
+                        let _permit = permit;
+                        let _ = tokio::time::timeout_at(deadline, handler.call(call)).await;
+                    });
                 }
                 Frame::Ping { nonce } => {
                     let _ = out.send(Frame::Pong { nonce }).await;
@@ -325,6 +372,7 @@ impl Target {
                 _ => {}
             }
         }
+        handlers.shutdown().await;
         self.handle.set(None);
         if registered {
             Ok(())

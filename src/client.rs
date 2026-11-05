@@ -80,7 +80,8 @@ pub(crate) async fn open_link(
             Err(ClientError::Refused(RemoteError { code, message }))
         }
         Some(Ok(other)) => Err(ClientError::Handshake(format!(
-            "unexpected frame {other:?}"
+            "unexpected frame {}",
+            other.kind()
         ))),
         Some(Err(err)) => Err(err.into()),
         None => Err(ClientError::Disconnected),
@@ -107,7 +108,7 @@ enum Waiter {
     Reply(ReplySender),
     Accepted(oneshot::Sender<Result<(), RemoteError>>),
     Stream(StreamSender),
-    Targets(oneshot::Sender<Vec<TargetInfo>>),
+    Targets(oneshot::Sender<Result<Vec<TargetInfo>, RemoteError>>),
 }
 
 struct State {
@@ -213,7 +214,7 @@ impl Client {
         payload: impl Into<Vec<u8>>,
         opts: &SendOptions,
     ) -> Result<mpsc::Receiver<Result<Vec<u8>, RemoteError>>, ClientError> {
-        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER + 1);
         let envelope = build_envelope(target, action, payload.into(), opts, Mode::Stream);
         self.submit(Waiter::Stream(tx), |id| {
             Frame::Send(Envelope { id, ..envelope })
@@ -248,7 +249,7 @@ impl Client {
         let (tx, rx) = oneshot::channel();
         self.submit(Waiter::Targets(tx), |id| Frame::ListTargets { id })
             .await?;
-        rx.await.map_err(|_| ClientError::Disconnected)
+        Ok(rx.await.map_err(|_| ClientError::Disconnected)??)
     }
 
     async fn submit(
@@ -315,19 +316,18 @@ async fn read_loop(
                     let _ = tx.send(Ok(payload));
                 }
                 Some(Waiter::Stream(tx)) => {
-                    let _ = tx.send(Ok(payload)).await;
+                    let _ = tx.try_send(Ok(payload));
                 }
                 _ => {}
             },
             Frame::StreamItem { id, payload } => {
-                let tx = match inner.state().waiters.get(&id) {
-                    Some(Waiter::Stream(tx)) => Some(tx.clone()),
-                    _ => None,
+                let mut state = inner.state();
+                let keep = match state.waiters.get(&id) {
+                    Some(Waiter::Stream(tx)) => push_stream_item(tx, payload),
+                    _ => true,
                 };
-                if let Some(tx) = tx
-                    && tx.send(Ok(payload)).await.is_err()
-                {
-                    inner.state().waiters.remove(&id);
+                if !keep {
+                    state.waiters.remove(&id);
                 }
             }
             Frame::StreamEnd { id } => {
@@ -350,14 +350,17 @@ async fn read_loop(
                         let _ = tx.send(Err(error));
                     }
                     Some(Waiter::Stream(tx)) => {
-                        let _ = tx.send(Err(error)).await;
+                        let _ = tx.try_send(Err(error));
                     }
-                    Some(Waiter::Targets(_)) | None => {}
+                    Some(Waiter::Targets(tx)) => {
+                        let _ = tx.send(Err(error));
+                    }
+                    None => {}
                 }
             }
             Frame::Targets { id, targets } => {
                 if let Some(Waiter::Targets(tx)) = take(&inner, id) {
-                    let _ = tx.send(targets);
+                    let _ = tx.send(Ok(targets));
                 }
             }
             Frame::Event {
@@ -387,6 +390,17 @@ async fn read_loop(
         state.open = false;
         state.waiters.clear();
     }
+}
+
+fn push_stream_item(tx: &StreamSender, payload: Vec<u8>) -> bool {
+    if tx.capacity() > 1 {
+        return tx.try_send(Ok(payload)).is_ok();
+    }
+    let _ = tx.try_send(Err(RemoteError {
+        code: ErrorCode::Overloaded,
+        message: "stream receiver fell behind, stream terminated".into(),
+    }));
+    false
 }
 
 fn take(inner: &Inner, id: u64) -> Option<Waiter> {
