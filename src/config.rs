@@ -109,6 +109,11 @@ impl Config {
                 "max_targets_per_principal",
                 limits.max_targets_per_principal,
             ),
+            ("max_target_bytes", limits.max_target_bytes),
+            (
+                "max_target_bytes_per_principal",
+                limits.max_target_bytes_per_principal,
+            ),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return invalid(format!("limits.{name} must be at least 1"));
@@ -117,6 +122,7 @@ impl Config {
             || limits.max_pending_bytes_per_principal > limits.max_pending_bytes
             || limits.max_subscriptions_per_session > limits.max_subscriptions_per_principal
             || limits.max_targets_per_principal > limits.max_targets
+            || limits.max_target_bytes_per_principal > limits.max_target_bytes
         {
             return invalid(
                 "per-principal and per-session limits must not exceed their totals".into(),
@@ -196,6 +202,8 @@ pub struct Limits {
     pub max_subscriptions_per_principal: usize,
     pub max_targets: usize,
     pub max_targets_per_principal: usize,
+    pub max_target_bytes: usize,
+    pub max_target_bytes_per_principal: usize,
     pub offline_target_retention_ms: u64,
 }
 
@@ -218,6 +226,8 @@ impl Default for Limits {
             max_subscriptions_per_principal: 4_096,
             max_targets: 10_000,
             max_targets_per_principal: 1_000,
+            max_target_bytes: 256 * 1024 * 1024,
+            max_target_bytes_per_principal: 32 * 1024 * 1024,
             offline_target_retention_ms: 3_600_000,
         }
     }

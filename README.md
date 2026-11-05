@@ -66,12 +66,14 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
   maximum retry attempts and backoff, handshake timeout, per-session buffer,
   and resource quotas:
   - `max_pending` / `max_pending_bytes`: requests the bus holds at once
-    (queued or in flight) across everyone, by count and by retained bytes
-    (payload plus names). `max_pending_per_principal` /
+    (queued or in flight) across everyone, by count and by estimated retained
+    bytes (payload, names, capability lists and per-item overhead). `max_pending_per_principal` /
     `max_pending_bytes_per_principal` apply the same per principal.
   - `max_subscriptions_per_session` / `max_subscriptions_per_principal`.
   - `max_targets` / `max_targets_per_principal`: registry size, counting
     offline targets. Re-registering a name you already own is always allowed.
+  - `max_target_bytes` / `max_target_bytes_per_principal`: estimated memory
+    held by registrations (names, actions, capability lists, groups).
   - `offline_target_retention_ms`: how long an offline target's actions and
     groups are kept before it is forgotten (default one hour). Messages for a
     forgotten name still queue.
@@ -143,7 +145,8 @@ Envelope fields (used by `send` and `deliver`):
 | `mode`    | string        | `request` (default), `fire` or `stream`     |
 | `payload` | bin           | optional, opaque                            |
 
-Names use `[A-Za-z0-9-_./:]`, at most 256 bytes.
+Names use `[A-Za-z0-9-_./:]`, at most 256 bytes. Capabilities are names too;
+an envelope or a registered action may list at most 64.
 
 Session flow:
 

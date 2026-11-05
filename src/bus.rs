@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::auth::Principal;
 use crate::config::{Config, Limits};
+use crate::footprint;
 use crate::hooks::{Hook, HookContext, LoggingHook, Operation, RateLimitHook};
 use crate::wire::{
     ActionSpec, Envelope, ErrorCode, Frame, GROUP_PREFIX, Mode, TargetInfo, valid_name,
@@ -18,6 +19,7 @@ pub type SessionId = u64;
 
 const MAX_ACTIONS: usize = 1024;
 const MAX_GROUPS: usize = 64;
+const MAX_CAPS: usize = 64;
 const WILDCARD: &str = "*";
 
 type Failure = (ErrorCode, String);
@@ -107,6 +109,7 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
         subs: HashMap::new(),
         usage: HashMap::new(),
         pending_bytes: 0,
+        target_bytes: 0,
         kicks: Vec::new(),
         next_id: 1,
         next_timer: 0,
@@ -134,6 +137,7 @@ struct TargetEntry {
     owner: Arc<str>,
     actions: Vec<ActionSpec>,
     groups: Vec<String>,
+    bytes: usize,
     forget_key: Option<(Instant, u64)>,
 }
 
@@ -149,6 +153,7 @@ struct Usage {
     pending_bytes: usize,
     subs: usize,
     targets: usize,
+    target_bytes: usize,
 }
 
 impl TargetEntry {
@@ -204,6 +209,7 @@ struct Bus {
     subs: HashMap<(String, String), HashSet<SessionId>>,
     usage: HashMap<Arc<str>, Usage>,
     pending_bytes: usize,
+    target_bytes: usize,
     kicks: Vec<SessionId>,
     next_id: u64,
     next_timer: u64,
@@ -228,10 +234,11 @@ fn valid_pattern(value: &str, check: fn(&str) -> bool) -> bool {
 }
 
 fn retained_bytes(envelope: &Envelope) -> usize {
-    envelope.payload.len()
-        + envelope.target.len()
-        + envelope.action.len()
-        + envelope.caps.iter().map(String::len).sum::<usize>()
+    footprint::envelope_bytes(envelope) + std::mem::size_of::<Pending>()
+}
+
+fn valid_caps(caps: &[String]) -> bool {
+    caps.len() <= MAX_CAPS && caps.iter().all(|cap| valid_name(cap))
 }
 
 fn is_retryable(code: ErrorCode) -> bool {
@@ -436,6 +443,12 @@ impl Bus {
         };
         if !valid_route(&envelope.target) || !valid_name(&envelope.action) {
             return Err((ErrorCode::Invalid, "invalid target or action name".into()));
+        }
+        if !valid_caps(&envelope.caps) {
+            return Err((
+                ErrorCode::Invalid,
+                format!("at most {MAX_CAPS} valid capability names are allowed"),
+            ));
         }
         if !caller.principal.may_address(&envelope.target) {
             return Err((
@@ -831,7 +844,7 @@ impl Bus {
             && groups.iter().all(|g| valid_name(g))
             && actions
                 .iter()
-                .all(|a| valid_name(&a.name) && a.caps.iter().all(|c| valid_name(c)));
+                .all(|a| valid_name(&a.name) && valid_caps(&a.caps));
         if !names_ok {
             return self.session_error(session, ErrorCode::Invalid, "invalid registration");
         }
@@ -864,14 +877,14 @@ impl Bus {
             );
         }
 
-        if let Err((code, message)) = self.check_target_quota(&owner, &target) {
-            return self.session_error(session, code, message);
-        }
-
         actions.sort_by(|a, b| a.name.cmp(&b.name));
         actions.dedup_by(|a, b| a.name == b.name);
         groups.sort();
         groups.dedup();
+        let bytes = footprint::registration_bytes(&target, &actions, &groups);
+        if let Err((code, message)) = self.check_target_quota(&owner, &target, bytes) {
+            return self.session_error(session, code, message);
+        }
         self.remove_target(&target);
         for group in &groups {
             self.groups
@@ -880,7 +893,10 @@ impl Bus {
                 .members
                 .insert(target.clone());
         }
-        self.usage.entry(owner.clone()).or_default().targets += 1;
+        let usage = self.usage.entry(owner.clone()).or_default();
+        usage.targets += 1;
+        usage.target_bytes += bytes;
+        self.target_bytes += bytes;
         self.targets.insert(
             target.clone(),
             TargetEntry {
@@ -888,6 +904,7 @@ impl Bus {
                 owner,
                 actions,
                 groups: groups.clone(),
+                bytes,
                 forget_key: None,
             },
         );
@@ -917,20 +934,36 @@ impl Bus {
         }
     }
 
-    fn check_target_quota(&self, owner: &str, target: &str) -> Result<(), Failure> {
+    fn check_target_quota(&self, owner: &str, target: &str, bytes: usize) -> Result<(), Failure> {
         let existing = self.targets.get(target);
-        if existing.is_some_and(|entry| &*entry.owner == owner) {
-            return Ok(());
-        }
-        let owned = self.usage_of(owner).map_or(0, |usage| usage.targets);
-        if owned >= self.limits.max_targets_per_principal {
+        let replaced_bytes = existing.map_or(0, |entry| entry.bytes);
+        let same_owner = existing.is_some_and(|entry| &*entry.owner == owner);
+        let (owned, owned_bytes) = self
+            .usage_of(owner)
+            .map_or((0, 0), |usage| (usage.targets, usage.target_bytes));
+        if !same_owner && owned >= self.limits.max_targets_per_principal {
             return Err((
                 ErrorCode::QuotaExceeded,
                 "target registration quota exceeded".into(),
             ));
         }
+        let owner_released = if same_owner { replaced_bytes } else { 0 };
+        if owned_bytes.saturating_sub(owner_released) + bytes
+            > self.limits.max_target_bytes_per_principal
+        {
+            return Err((
+                ErrorCode::QuotaExceeded,
+                "target registration byte quota exceeded".into(),
+            ));
+        }
         if existing.is_none() && self.targets.len() >= self.limits.max_targets {
             return Err((ErrorCode::Overloaded, "target registry is full".into()));
+        }
+        if self.target_bytes.saturating_sub(replaced_bytes) + bytes > self.limits.max_target_bytes {
+            return Err((
+                ErrorCode::Overloaded,
+                "target registry byte budget is full".into(),
+            ));
         }
         Ok(())
     }
@@ -942,7 +975,9 @@ impl Bus {
         }
         if let Some(usage) = self.usage.get_mut(&entry.owner) {
             usage.targets = usage.targets.saturating_sub(1);
+            usage.target_bytes = usage.target_bytes.saturating_sub(entry.bytes);
         }
+        self.target_bytes = self.target_bytes.saturating_sub(entry.bytes);
         for group_name in &entry.groups {
             if let Some(group) = self.groups.get_mut(group_name) {
                 group.members.remove(name);

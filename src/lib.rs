@@ -2,6 +2,7 @@ pub mod auth;
 pub mod bus;
 pub mod client;
 pub mod config;
+mod footprint;
 pub mod hooks;
 pub mod server;
 pub mod target;

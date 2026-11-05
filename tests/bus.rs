@@ -630,7 +630,7 @@ async fn pending_requests_are_bounded_by_count_and_bytes() {
     let mut config = Config::default();
     config.limits.max_pending = 3;
     config.limits.max_pending_per_principal = 2;
-    config.limits.max_pending_bytes_per_principal = 100;
+    config.limits.max_pending_bytes_per_principal = 1_500;
     let bus = start(config);
     let mut target = Peer::connect(&bus, anyone()).await;
     target.register("slow", &["op"], &[]).await;
@@ -638,7 +638,7 @@ async fn pending_requests_are_bounded_by_count_and_bytes() {
     let mut bob = Peer::connect(&bus, principal("bob", Grant::everything())).await;
 
     alice
-        .send(Frame::Send(envelope(1, "slow", "op", &[0; 200])))
+        .send(Frame::Send(envelope(1, "slow", "op", &[0; 2_000])))
         .await;
     assert_eq!(expect_fail(&mut alice).await, (1, ErrorCode::QuotaExceeded));
 
@@ -851,4 +851,62 @@ async fn fire_and_forget_rejected_before_acceptance_reports_failure() {
     assert_eq!(caller.recv().await, Frame::Accepted { id: 5 });
     expect_deliver(&mut target).await;
     caller.assert_silent().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn capability_lists_are_bounded_validated_and_counted() {
+    let mut config = Config::default();
+    config.limits.max_pending_bytes_per_principal = 1_500;
+    let bus = start(config);
+    let mut caller = Peer::connect(&bus, anyone()).await;
+
+    let mut too_many = envelope(1, "off", "op", b"");
+    too_many.caps = vec!["a".into(); 65];
+    caller.send(Frame::Send(too_many)).await;
+    assert_eq!(expect_fail(&mut caller).await, (1, ErrorCode::Invalid));
+
+    let mut empty = envelope(2, "off", "op", b"");
+    empty.caps = vec![String::new()];
+    caller.send(Frame::Send(empty)).await;
+    assert_eq!(expect_fail(&mut caller).await, (2, ErrorCode::Invalid));
+
+    let mut container_heavy = envelope(3, "off", "op", b"");
+    container_heavy.caps = vec!["a".into(); 60];
+    caller.send(Frame::Send(container_heavy)).await;
+    assert_eq!(
+        expect_fail(&mut caller).await,
+        (3, ErrorCode::QuotaExceeded)
+    );
+
+    caller
+        .send(Frame::Send(envelope(4, "off", "op", b"")))
+        .await;
+    caller.assert_silent().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn registration_metadata_is_bounded_by_count_and_bytes() {
+    let mut config = Config::default();
+    config.limits.max_target_bytes_per_principal = 4_000;
+    let bus = start(config);
+
+    let mut peer = Peer::connect(&bus, anyone()).await;
+    peer.send(Frame::Register {
+        target: "t".into(),
+        actions: vec![ActionSpec::with_caps("op", vec!["a"; 65])],
+        groups: vec![],
+    })
+    .await;
+    assert_eq!(expect_error(&mut peer).await, ErrorCode::Invalid);
+
+    let long_cap = "c".repeat(50);
+    peer.send(Frame::Register {
+        target: "t".into(),
+        actions: vec![ActionSpec::with_caps("op", vec![long_cap.as_str(); 60])],
+        groups: vec![],
+    })
+    .await;
+    assert_eq!(expect_error(&mut peer).await, ErrorCode::QuotaExceeded);
+
+    peer.register("t", &["op"], &[]).await;
 }
