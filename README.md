@@ -340,6 +340,13 @@ A failed write, such as a frame over the SDK's 16 MiB limit, closes the whole
 connection: the client's pending requests fail with `Disconnected` and
 `is_connected()` returns false, and a target reconnects.
 
+## Development
+
+`.github/workflows/ci.yml` runs `cargo fmt --all --check`,
+`cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked`
+on pushes to `prod` and on pull requests. Run the same three commands before
+committing.
+
 ## Licence
 
 MIT, copyright Florin Sarca. See [LICENSE](LICENSE).
