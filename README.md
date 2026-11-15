@@ -5,7 +5,11 @@ Serialised Arbitrary Remote Control Autonomy. A Flow Construct Studios project.
 SARCA is a lightweight, self-hosted remote-control bus. Callers (CLIs, dashboards,
 scripts, AI agents, webhooks) send commands; targets (game instances, servers,
 devices, services) execute them. Neither side knows about the other: both speak
-SARCA to the bus, and targets dial out, so they need no inbound ports.
+SARCA to the bus. Callers and targets only dial out, so they need no inbound
+ports of their own. The bus is the one listener: it needs an address (TCP,
+WebSocket or unix socket) that every caller and target can reach. It has no
+TLS, so reaching it across an untrusted network takes a tunnel or VPN on both
+ends; see [Security notes](#security-notes).
 
 ```
 [callers] -> SARCA bus -> [targets]
@@ -24,7 +28,8 @@ SARCA to the bus, and targets dial out, so they need no inbound ports.
 
 ## Build
 
-Built and tested with Rust 1.99 (edition 2024).
+Built and tested with Rust 1.99 (edition 2024). Unix only (developed on Linux): the
+server and CLI use unix sockets and signals and do not build on Windows.
 
 ```sh
 cargo build --release
@@ -249,7 +254,9 @@ only on fatal refusals (bad token, forbidden name, invalid registration). A
 `Call` dropped without an answer reports `target_failed` to the caller.
 `TargetConfig::rules` holds `LocalRule`s triggered by `Every(duration)`,
 `Connected` or `Disconnected`; they call the same handler with a local `Call`
-(`call.is_local()`), whether or not the bus is reachable. `target.handle()`
+(`call.is_local()`), whether or not the bus is reachable. `Every` and
+`Connected` rules run beside deliveries, outside `max_concurrent`, so a slow
+one does not hold up requests. `target.handle()`
 returns a `TargetHandle` for `emit`. Dropping or aborting the `run` future
 closes its connection, so the bus marks the target offline and the handle
 reports disconnected.
@@ -288,9 +295,12 @@ logging. Hooks run on the bus task, so they must be fast and must not block.
 
 ## Security notes
 
-- There is no TLS. Bind to localhost or a private network, or put the TCP/WS
-  listener behind a TLS-terminating proxy or tunnel. Tokens travel in clear text
-  otherwise.
+- There is no TLS, on the bus or in the SDK and CLI (`wss://` URLs are
+  rejected). Tokens and payloads travel in clear text, so bind to localhost or
+  a private network. To cross an untrusted network, carry the connection in a
+  VPN or tunnel (WireGuard, SSH forwarding, stunnel) that both the bus and the
+  remote callers and targets use; a TLS-terminating proxy in front of the bus
+  alone is not enough, because the SDK cannot connect to it.
 - Keep the config file readable only by the service user; it holds token hashes
   and grants.
 - The unix socket defaults to mode `0600`.
