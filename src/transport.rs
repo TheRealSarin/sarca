@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
@@ -12,6 +15,94 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use crate::wire::{self, Frame, WireError};
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_HELLO_BYTES: usize = 4096;
+pub(crate) const IO_HANDSHAKE_BYTES: usize = MAX_HELLO_BYTES + 4;
+pub(crate) const WS_HANDSHAKE_BYTES: usize = 32 * 1024;
+
+pub(crate) struct GateKey(Arc<AtomicBool>);
+
+impl GateKey {
+    pub(crate) fn open(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) struct Gated<S> {
+    io: S,
+    open: Arc<AtomicBool>,
+    remaining: usize,
+}
+
+pub(crate) fn gated<S>(io: S, limit: usize) -> (Gated<S>, GateKey) {
+    let open = Arc::new(AtomicBool::new(false));
+    let gated = Gated {
+        io,
+        open: open.clone(),
+        remaining: limit,
+    };
+    (gated, GateKey(open))
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Gated<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.open.load(Ordering::Acquire) {
+            return Pin::new(&mut this.io).poll_read(cx, buf);
+        }
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if this.remaining == 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "handshake exceeds the unauthenticated byte limit",
+            )));
+        }
+        let allowed = buf.remaining().min(this.remaining);
+        let mut limited = ReadBuf::new(buf.initialize_unfilled_to(allowed));
+        let polled = Pin::new(&mut this.io).poll_read(cx, &mut limited);
+        let read = limited.filled().len();
+        if polled.is_ready() {
+            this.remaining -= read;
+            buf.advance(read);
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Gated<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -118,10 +209,10 @@ where
 }
 
 fn decode_incoming(bytes: &[u8], handshake: bool) -> Result<Frame, TransportError> {
-    if handshake && bytes.len() > 4096 {
+    if handshake && bytes.len() > MAX_HELLO_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "hello exceeds 4096 bytes",
+            "hello exceeds the handshake size limit",
         )
         .into());
     }
@@ -239,6 +330,23 @@ mod tests {
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn gate_caps_reads_until_it_is_opened() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (mut gated, key) = gated(server, 8);
+        client.write_all(&[7; 32]).await.unwrap();
+        let mut buf = [0u8; 32];
+        assert_eq!(gated.read(&mut buf).await.unwrap(), 8);
+        assert_eq!(
+            gated.read(&mut buf).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        key.open();
+        assert_eq!(gated.read(&mut buf).await.unwrap(), 24);
+    }
+
     #[test]
     fn handshake_rejects_non_hello_and_large_hello() {
         assert!(decode_incoming(&wire::encode(&Frame::Ping { nonce: 1 }).unwrap(), true).is_err());

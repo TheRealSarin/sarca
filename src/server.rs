@@ -19,7 +19,10 @@ use crate::auth::Authenticator;
 use crate::bus::{self, BusHandle};
 use crate::config::{Config, Limits};
 use crate::hooks::Hook;
-use crate::transport::{FrameSink, FrameStream, framed_io_server, framed_ws_server};
+use crate::transport::{
+    FrameSink, FrameStream, GateKey, IO_HANDSHAKE_BYTES, WS_HANDSHAKE_BYTES, framed_io_server,
+    framed_ws_server, gated,
+};
 use crate::wire::{ErrorCode, Frame};
 
 #[derive(Debug, thiserror::Error)]
@@ -228,9 +231,11 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, websocket: bool)
             let _permit = permit;
             let peer = peer.to_string();
             if !websocket {
+                let (stream, gate) = gated(stream, IO_HANDSHAKE_BYTES);
                 let (sink, stream) = framed_io_server(stream, shared.limits.max_frame_bytes);
-                return run_session(shared, sink, stream, peer).await;
+                return run_session(shared, sink, stream, gate, peer).await;
             }
+            let (stream, gate) = gated(stream, WS_HANDSHAKE_BYTES);
             let ws_config = WebSocketConfig::default()
                 .max_message_size(Some(shared.limits.max_frame_bytes))
                 .max_frame_size(Some(shared.limits.max_frame_bytes));
@@ -246,7 +251,7 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, websocket: bool)
             match tokio::time::timeout(handshake_timeout(&shared), handshake).await {
                 Ok(Ok(ws)) => {
                     let (sink, stream) = framed_ws_server(ws);
-                    run_session(shared, sink, stream, peer).await;
+                    run_session(shared, sink, stream, gate, peer).await;
                 }
                 Ok(Err(err)) => tracing::debug!(%peer, %err, "websocket handshake failed"),
                 Err(_) => tracing::debug!(%peer, "websocket handshake timed out"),
@@ -268,12 +273,13 @@ async fn accept_unix(listener: UnixListener, shared: Arc<Shared>) {
         let Ok(permit) = shared.connections.clone().acquire_owned().await else {
             return;
         };
+        let (stream, gate) = gated(stream, IO_HANDSHAKE_BYTES);
         let (sink, stream) = framed_io_server(stream, shared.limits.max_frame_bytes);
         while sessions.try_join_next().is_some() {}
         let shared = shared.clone();
         sessions.spawn(async move {
             let _permit = permit;
-            run_session(shared, sink, stream, "unix".to_string()).await;
+            run_session(shared, sink, stream, gate, "unix".to_string()).await;
         });
     }
 }
@@ -296,6 +302,7 @@ async fn run_session(
     shared: Arc<Shared>,
     mut sink: FrameSink,
     mut stream: FrameStream,
+    gate: GateKey,
     peer: String,
 ) {
     let hello = tokio::time::timeout(handshake_timeout(&shared), stream.next()).await;
@@ -307,6 +314,7 @@ async fn run_session(
         tracing::warn!(%peer, ?client, "authentication failed");
         return reject(sink, ErrorCode::Unauthorized, "authentication failed").await;
     };
+    gate.open();
     let principal_name = principal.name.clone();
     let Ok((session, mut outbound)) = shared.bus.connect(principal).await else {
         return reject(sink, ErrorCode::Unavailable, "bus unavailable").await;

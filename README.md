@@ -296,6 +296,12 @@ values overall. Binary payloads are not arrays and retain the configured frame
 size limit. These bounds also apply to unknown fields. The initial hello must
 fit within 4,096 encoded bytes and must be a hello frame.
 
+Until a connection has authenticated, the bus reads at most 4,100 bytes from
+it on TCP and unix sockets (the hello and its length prefix) and 32 KiB on
+WebSocket (the HTTP upgrade request plus the hello). A connection that sends
+more without completing a valid hello is closed, so unauthenticated peers
+cannot make the bus buffer large frames.
+
 A stream interrupted by connection loss ends with `unavailable`, including
 when its item buffer is full. Cancellation while waiting to enqueue a request
 does not leave a response waiter behind.

@@ -672,3 +672,51 @@ async fn websocket_handshakes_from_unlisted_origins_are_refused() {
     assert!(sdk.targets().await.is_ok());
     server.stop().await;
 }
+
+#[tokio::test]
+async fn unauthenticated_connection_cannot_buffer_a_large_frame() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut config = Config::default();
+    config.limits.handshake_timeout_ms = 600_000;
+    let running = start(config, false).await;
+    let addr = running.tcp.strip_prefix("tcp://").unwrap();
+
+    let mut raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+    raw.write_all(&(1u32 << 20).to_be_bytes()).await.unwrap();
+    let _ = raw.write_all(&[0u8; 64 * 1024]).await;
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(WAIT, raw.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "bus kept reading an oversized hello");
+
+    let (mut sink, mut stream) = Endpoint::parse(&running.tcp)
+        .unwrap()
+        .connect(DEFAULT_MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    let hello = Frame::Hello {
+        client: "pipelined".into(),
+        token: None,
+    };
+    let big = Frame::Emit {
+        event: "ignored".into(),
+        payload: vec![0; 64 * 1024],
+    };
+    sink.feed(hello).await.unwrap();
+    sink.feed(big).await.unwrap();
+    sink.send(Frame::Ping { nonce: 9 }).await.unwrap();
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(frame))) = tokio::time::timeout(WAIT, stream.next()).await {
+        let done = frame == Frame::Pong { nonce: 9 };
+        seen.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        matches!(seen.first(), Some(Frame::Welcome { .. })),
+        "{seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&Frame::Pong { nonce: 9 }));
+    running.stop().await;
+}
