@@ -196,8 +196,10 @@ an envelope or a registered action may list at most 64.
 
 Session flow:
 
-1. Client sends `hello {client, token?}`. Bus answers `welcome {session}` or
-   `error {code, message}` and closes.
+1. Client sends `hello {client, token?, version?}`. Bus answers
+   `welcome {session, version}` or `error {code, message}` and closes. The
+   protocol version is `1`; a hello without one is treated as `1`, and any
+   other value is refused with `protocol`.
 2. A target sends `register {target, actions: [{name, caps}], groups}` and gets
    `registered {target}` or `error`.
 3. A caller sends `send <envelope>`. The bus forwards `deliver <envelope>` to

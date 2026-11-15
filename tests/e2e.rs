@@ -495,6 +495,7 @@ async fn stalled_reader_is_disconnected_and_frees_its_connection_slot() {
     sink.send(Frame::Hello {
         client: "stalled".into(),
         token: None,
+        version: wire::PROTOCOL_VERSION,
     })
     .await
     .unwrap();
@@ -654,6 +655,7 @@ async fn websocket_handshakes_from_unlisted_origins_are_refused() {
     let hello = Frame::Hello {
         client: "dashboard".into(),
         token: None,
+        version: wire::PROTOCOL_VERSION,
     };
     ws.send(Message::Binary(wire::encode(&hello).unwrap().into()))
         .await
@@ -697,6 +699,7 @@ async fn unauthenticated_connection_cannot_buffer_a_large_frame() {
     let hello = Frame::Hello {
         client: "pipelined".into(),
         token: None,
+        version: wire::PROTOCOL_VERSION,
     };
     let big = Frame::Emit {
         event: "ignored".into(),
@@ -739,6 +742,7 @@ async fn silent_peer_is_pinged_then_disconnected() {
     sink.send(Frame::Hello {
         client: "mute".into(),
         token: None,
+        version: wire::PROTOCOL_VERSION,
     })
     .await
     .unwrap();
@@ -773,5 +777,31 @@ async fn idle_client_and_target_survive_the_keepalive_timeout() {
         .unwrap();
     assert_eq!(reply, b"still here");
     target.abort();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn unsupported_protocol_version_is_refused() {
+    let running = start(Config::default(), false).await;
+    let (mut sink, mut stream) = Endpoint::parse(&running.tcp)
+        .unwrap()
+        .connect(DEFAULT_MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    sink.send(Frame::Hello {
+        client: "future".into(),
+        token: None,
+        version: wire::PROTOCOL_VERSION + 1,
+    })
+    .await
+    .unwrap();
+    let refusal = tokio::time::timeout(WAIT, stream.next()).await.unwrap();
+    assert!(matches!(
+        refusal,
+        Some(Ok(Frame::Error {
+            code: ErrorCode::Protocol,
+            ..
+        }))
+    ));
     running.stop().await;
 }

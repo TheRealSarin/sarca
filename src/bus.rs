@@ -370,7 +370,8 @@ impl Bus {
                 subs: HashSet::new(),
             },
         );
-        self.send_to(session, Frame::Welcome { session });
+        let version = wire::PROTOCOL_VERSION;
+        self.send_to(session, Frame::Welcome { session, version });
     }
 
     fn on_frame(&mut self, session: SessionId, frame: Frame) {

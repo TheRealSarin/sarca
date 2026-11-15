@@ -353,11 +353,13 @@ mod handshake_tests {
         let hello = Frame::Hello {
             client: "x".repeat(4096),
             token: None,
+            version: wire::PROTOCOL_VERSION,
         };
         assert!(decode_incoming(&wire::encode(&hello).unwrap(), true).is_err());
         let hello = Frame::Hello {
             client: "client".into(),
             token: None,
+            version: wire::PROTOCOL_VERSION,
         };
         assert_eq!(
             decode_incoming(&wire::encode(&hello).unwrap(), true).unwrap(),

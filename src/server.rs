@@ -23,7 +23,7 @@ use crate::transport::{
     FrameSink, FrameStream, GateKey, IO_HANDSHAKE_BYTES, WS_HANDSHAKE_BYTES, framed_io_server,
     framed_ws_server, gated,
 };
-use crate::wire::{ErrorCode, Frame};
+use crate::wire::{ErrorCode, Frame, PROTOCOL_VERSION};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -307,7 +307,18 @@ async fn run_session(
 ) {
     let hello = tokio::time::timeout(handshake_timeout(&shared), stream.next()).await;
     let (client, token) = match hello {
-        Ok(Some(Ok(Frame::Hello { client, token }))) => (client, token),
+        Ok(Some(Ok(Frame::Hello {
+            client,
+            token,
+            version: PROTOCOL_VERSION,
+        }))) => (client, token),
+        Ok(Some(Ok(Frame::Hello { version, .. }))) => {
+            tracing::warn!(%peer, version, "unsupported protocol version");
+            let message = format!(
+                "unsupported protocol version {version}; this bus speaks {PROTOCOL_VERSION}"
+            );
+            return reject(sink, ErrorCode::Protocol, &message).await;
+        }
         _ => return reject(sink, ErrorCode::Protocol, "expected hello").await,
     };
     let Some(principal) = shared.auth.authenticate(token.as_deref()) else {

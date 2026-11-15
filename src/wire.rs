@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub const GROUP_PREFIX: &str = "group:";
 pub const MAX_NAME_LEN: usize = 256;
+pub const PROTOCOL_VERSION: u32 = 1;
+
+fn protocol_version() -> u32 {
+    PROTOCOL_VERSION
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retry {
@@ -105,9 +110,13 @@ pub enum Frame {
     Hello {
         client: String,
         token: Option<String>,
+        #[serde(default = "protocol_version")]
+        version: u32,
     },
     Welcome {
         session: u64,
+        #[serde(default = "protocol_version")]
+        version: u32,
     },
     Register {
         target: String,
@@ -380,11 +389,36 @@ mod tests {
     }
 
     #[test]
+    fn hello_without_a_version_is_version_one() {
+        #[derive(Serialize)]
+        struct Unversioned<'a> {
+            r#type: &'a str,
+            client: &'a str,
+            token: Option<&'a str>,
+        }
+        let bytes = rmp_serde::to_vec_named(&Unversioned {
+            r#type: "hello",
+            client: "old",
+            token: None,
+        })
+        .unwrap();
+        assert_eq!(
+            decode(&bytes).unwrap(),
+            Frame::Hello {
+                client: "old".into(),
+                token: None,
+                version: 1,
+            }
+        );
+    }
+
+    #[test]
     fn frames_round_trip() {
         let frames = vec![
             Frame::Hello {
                 client: "cli".into(),
                 token: Some("secret".into()),
+                version: PROTOCOL_VERSION,
             },
             Frame::Send(sample_envelope()),
             Frame::Deliver(sample_envelope()),
@@ -478,6 +512,7 @@ mod tests {
             Frame::Hello {
                 client: "cli".into(),
                 token: Some("secret".into()),
+                version: PROTOCOL_VERSION,
             },
             Frame::Deliver(sample_envelope()),
             Frame::StreamItem {

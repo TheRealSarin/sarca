@@ -1008,7 +1008,11 @@ async fn kicked_session_signals_its_connection_to_close() {
     let bus = start(Config::default());
     let mut peer = Peer::connect(&bus, anyone()).await;
     assert!(!peer.rx.is_closed());
-    peer.send(Frame::Welcome { session: 0 }).await;
+    peer.send(Frame::Welcome {
+        session: 0,
+        version: wire::PROTOCOL_VERSION,
+    })
+    .await;
     assert_eq!(expect_error(&mut peer).await, ErrorCode::Protocol);
     assert!(peer.rx.recv().await.is_none());
     assert!(peer.rx.is_closed());

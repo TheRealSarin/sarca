@@ -29,7 +29,7 @@ pub(crate) fn actions_bytes(actions: &[ActionSpec]) -> usize {
 
 pub(crate) fn frame_bytes(frame: &Frame) -> usize {
     let content = match frame {
-        Frame::Hello { client, token } => client.len() + token.as_ref().map_or(0, String::len),
+        Frame::Hello { client, token, .. } => client.len() + token.as_ref().map_or(0, String::len),
         Frame::Register {
             target,
             actions,

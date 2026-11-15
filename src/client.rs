@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::transport::{DEFAULT_MAX_FRAME_BYTES, Endpoint, FrameSink, FrameStream, TransportError};
-use crate::wire::{Envelope, ErrorCode, Frame, Mode, Retry, TargetInfo};
+use crate::wire::{Envelope, ErrorCode, Frame, Mode, PROTOCOL_VERSION, Retry, TargetInfo};
 
 const OUTBOUND_BUFFER: usize = 256;
 const STREAM_BUFFER: usize = 256;
@@ -68,13 +68,14 @@ pub(crate) async fn open_link(
     sink.send(Frame::Hello {
         client: client.to_string(),
         token: token.map(str::to_string),
+        version: PROTOCOL_VERSION,
     })
     .await?;
     let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.next())
         .await
         .map_err(|_| ClientError::Handshake("timed out".into()))?;
     match reply {
-        Some(Ok(Frame::Welcome { session })) => Ok(Link {
+        Some(Ok(Frame::Welcome { session, .. })) => Ok(Link {
             session,
             sink,
             stream,
