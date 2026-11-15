@@ -2,6 +2,7 @@
 name = "sarca"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 publish = false
 description = "Serialised Arbitrary Remote Control Autonomy: a self-hosted remote-control bus"
 license = "MIT"
