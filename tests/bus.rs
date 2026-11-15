@@ -568,6 +568,68 @@ async fn requests_of_a_disconnected_caller_are_dropped() {
     target.assert_silent().await;
 }
 
+fn fire(id: u64, target: &str, payload: &[u8]) -> Frame {
+    let mut env = envelope(id, target, "op", payload);
+    env.mode = Mode::Fire;
+    Frame::Send(env)
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_fire_and_forget_outlives_its_sender() {
+    let bus = start(Config::default());
+    let mut caller = Peer::connect(&bus, anyone()).await;
+    caller.send(fire(1, "later", b"kept")).await;
+    assert_eq!(caller.recv().await, Frame::Accepted { id: 1 });
+    caller.send(fire(2, "never", b"expires")).await;
+    assert_eq!(caller.recv().await, Frame::Accepted { id: 2 });
+    caller.disconnect().await;
+
+    let mut target = Peer::connect(&bus, anyone()).await;
+    target.register("later", &["op"], &[]).await;
+    assert_eq!(expect_deliver(&mut target).await.payload, b"kept");
+
+    tokio::time::sleep(Duration::from_millis(
+        Config::default().limits.default_ttl_ms + 1,
+    ))
+    .await;
+    let mut late = Peer::connect(&bus, anyone()).await;
+    late.register("never", &["op"], &[]).await;
+    late.assert_silent().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fire_and_forget_keeps_its_sender_grant_for_fallbacks() {
+    let config = Config {
+        rules: vec![Rule {
+            when_down: "primary".into(),
+            route_to: vec!["backup".into()],
+        }],
+        ..Config::default()
+    };
+    let bus = start(config);
+    let narrow = Grant {
+        send: vec!["primary".into()],
+        ..Grant::default()
+    };
+    let mut limited = Peer::connect(&bus, principal("narrow", narrow)).await;
+    limited.send(fire(1, "primary", b"narrow")).await;
+    assert_eq!(limited.recv().await, Frame::Accepted { id: 1 });
+    limited.disconnect().await;
+    let mut broad = Peer::connect(&bus, anyone()).await;
+    broad.send(fire(2, "primary", b"broad")).await;
+    assert_eq!(broad.recv().await, Frame::Accepted { id: 2 });
+    broad.disconnect().await;
+
+    let mut backup = Peer::connect(&bus, anyone()).await;
+    backup.register("backup", &["op"], &[]).await;
+    assert_eq!(expect_deliver(&mut backup).await.payload, b"broad");
+    backup.assert_silent().await;
+
+    let mut primary = Peer::connect(&bus, anyone()).await;
+    primary.register("primary", &["op"], &[]).await;
+    assert_eq!(expect_deliver(&mut primary).await.payload, b"narrow");
+}
+
 fn principal(name: &str, grant: Grant) -> Principal {
     let token = format!("{name}-token");
     Authenticator::new(&AuthConfig {

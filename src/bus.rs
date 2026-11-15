@@ -165,7 +165,7 @@ pub fn spawn(config: &Config, extra_hooks: Vec<Arc<dyn Hook>>) -> BusHandle {
 }
 
 struct Session {
-    principal: Principal,
+    principal: Arc<Principal>,
     owner: Arc<str>,
     out: OutboundSender,
     target: Option<String>,
@@ -214,6 +214,7 @@ enum Stage {
 
 struct Pending {
     caller: SessionId,
+    principal: Arc<Principal>,
     owner: Arc<str>,
     bytes: usize,
     caller_id: u64,
@@ -360,7 +361,7 @@ impl Bus {
         self.sessions.insert(
             session,
             Session {
-                principal,
+                principal: Arc::new(principal),
                 owner,
                 out,
                 target: None,
@@ -603,7 +604,11 @@ impl Bus {
         if let Err(failure) = self.validate_send(session, &mut envelope) {
             return self.reply_fail(session, caller_id, failure);
         }
-        let Some(owner) = self.sessions.get(&session).map(|s| s.owner.clone()) else {
+        let Some((owner, principal)) = self
+            .sessions
+            .get(&session)
+            .map(|s| (s.owner.clone(), s.principal.clone()))
+        else {
             return;
         };
 
@@ -630,6 +635,7 @@ impl Bus {
             id,
             Pending {
                 caller: session,
+                principal,
                 owner,
                 bytes,
                 caller_id,
@@ -694,8 +700,8 @@ impl Bus {
         let key = pending.envelope.target.clone();
         let action = pending.envelope.action.clone();
         let base = footprint::delivery_bytes(&pending.envelope, "");
-        let caller = pending.caller;
-        match self.resolve(&key, &action, base, caller) {
+        let principal = pending.principal.clone();
+        match self.resolve(&key, &action, base, &principal) {
             Route::Online(session, name) => self.deliver(id, session, &name),
             Route::Busy => Attempt::Wait { busy: true },
             Route::Offline => Attempt::Wait { busy: false },
@@ -787,17 +793,13 @@ impl Bus {
         true
     }
 
-    fn resolve(&mut self, key: &str, action: &str, base: usize, caller: SessionId) -> Route {
+    fn resolve(&mut self, key: &str, action: &str, base: usize, sender: &Principal) -> Route {
         match self.resolve_direct(key, action, base) {
             Route::Offline => {
                 let backups = self.rules.get(key).cloned().unwrap_or_default();
                 let mut busy = false;
                 for backup in backups {
-                    let allowed = self
-                        .sessions
-                        .get(&caller)
-                        .is_some_and(|entry| entry.principal.may_address(&backup));
-                    if !allowed {
+                    if !sender.may_address(&backup) {
                         continue;
                     }
                     match self.resolve_direct(&backup, action, base) {
@@ -1465,7 +1467,13 @@ impl Bus {
             usage.subs = usage.subs.saturating_sub(entry.subs.len());
         }
         for id in entry.owned {
-            self.finish(id);
+            let outlives_sender = self
+                .pending
+                .get(&id)
+                .is_some_and(|pending| pending.envelope.mode == Mode::Fire && pending.acknowledged);
+            if !outlives_sender {
+                self.finish(id);
+            }
         }
         for id in entry.inflight {
             if let Some(pending) = self.pending.get_mut(&id) {

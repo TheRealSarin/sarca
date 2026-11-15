@@ -150,12 +150,18 @@ verified the caller holds every claimed capability. Targets receive the verified
 - A stream that has already forwarded an item is never retried.
 - Fire-and-forget gets an `accepted` reply once the bus has delivered or queued
   it. Later failures (expiry, full queue on retry) are logged, not reported.
+  An accepted message does not depend on its sender: it stays queued after
+  the sender disconnects (so `sarca send --fire` can leave work for an offline
+  target), keeps the sender's grant for fallback routing, and counts against
+  the sender's pending quota until it is delivered or its TTL runs out.
 - `group:<name>` round-robins across online members that support the action,
   skipping members with no outbound room.
 - Sends beyond a principal's pending quota fail with `quota_exceeded`; beyond
   the bus-wide totals, with `overloaded`. Both are marked retryable. The same
   codes apply to subscription and registration quotas.
-- If a caller disconnects, its outstanding requests are dropped.
+- If a caller disconnects, its outstanding requests and streams are dropped.
+- Queues live in memory only. Restarting the bus loses every queued and
+  in-flight message; nothing is written to disk.
 
 ## Wire protocol
 
