@@ -283,7 +283,7 @@ impl Target {
 
         let mut delay = self.config.reconnect_min;
         loop {
-            match self.session(&handler).await {
+            match self.session(&handler, &mut background).await {
                 Err(ClientError::Refused(error)) if is_fatal(error.code) => {
                     self.handle.set(None);
                     return Err(ClientError::Refused(error));
@@ -307,7 +307,11 @@ impl Target {
         }
     }
 
-    async fn session<H: Handler>(&self, handler: &Arc<H>) -> Result<(), ClientError> {
+    async fn session<H: Handler>(
+        &self,
+        handler: &Arc<H>,
+        background: &mut JoinSet<()>,
+    ) -> Result<(), ClientError> {
         let config = &self.config;
         let link = open_link(&config.url, config.token.as_deref(), &config.name).await?;
         let mut stream = link.stream;
@@ -348,8 +352,22 @@ impl Target {
                     registered = true;
                     tracing::info!(target = %config.name, "registered with bus");
                     self.handle.set(Some(out.clone()));
-                    self.run_rules(handler, |t| matches!(t, Trigger::Connected))
-                        .await;
+                    let rules: Vec<LocalRule> = config
+                        .rules
+                        .iter()
+                        .filter(|rule| matches!(rule.trigger, Trigger::Connected))
+                        .cloned()
+                        .collect();
+                    if !rules.is_empty() {
+                        while background.try_join_next().is_some() {}
+                        let handler = handler.clone();
+                        let name = config.name.clone();
+                        background.spawn(async move {
+                            for rule in &rules {
+                                handler.call(Call::local(&name, rule)).await;
+                            }
+                        });
+                    }
                 }
                 Frame::Deliver(envelope) => {
                     let Ok(permit) = permits.clone().try_acquire_owned() else {

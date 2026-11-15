@@ -805,3 +805,32 @@ async fn unsupported_protocol_version_is_refused() {
     ));
     running.stop().await;
 }
+
+#[tokio::test]
+async fn slow_connected_rule_does_not_stall_deliveries() {
+    let running = start(Config::default(), false).await;
+    let mut config = TargetConfig::new(&running.tcp, "echo-1", echo_actions());
+    config.rules = vec![LocalRule {
+        trigger: Trigger::Connected,
+        action: "hang".into(),
+        payload: Vec::new(),
+    }];
+    let target = tokio::spawn(Target::new(config).run(|call: Call| async move {
+        if call.is_local() {
+            std::future::pending::<()>().await;
+        }
+        echo(call).await;
+    }));
+    let client = Client::connect(&running.tcp, None).await.unwrap();
+    wait_for_target(&client, "echo-1").await;
+    let opts = SendOptions {
+        ttl: Some(WAIT),
+        ..SendOptions::default()
+    };
+    let reply = client
+        .request("echo-1", "echo", b"hi".to_vec(), &opts)
+        .await;
+    assert_eq!(reply.unwrap(), b"hi");
+    target.abort();
+    running.stop().await;
+}
