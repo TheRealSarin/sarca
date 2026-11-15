@@ -68,8 +68,14 @@ See `sarca.example.toml`. Unknown keys are rejected. Sections:
   bus unless listed. Clients that send no `Origin` header (the SDK and CLI) are
   not affected.
 - `[limits]`: frame size, per-target queue length, default and maximum TTL,
-  maximum retry attempts and backoff, handshake timeout, per-session buffer,
-  and resource quotas:
+  maximum retry attempts and backoff, handshake timeout, keepalive,
+  per-session buffer, and resource quotas:
+  - `keepalive_interval_ms` / `keepalive_timeout_ms` (defaults 15 s and 45 s):
+    the bus sends every connection a `ping` each interval and closes one from
+    which it has received no frame at all for the timeout, so a peer that
+    vanished without closing (power loss, NAT timeout) goes offline and its
+    in-flight requests are retried or rerouted. The timeout must exceed the
+    interval.
   - `max_pending` / `max_pending_bytes`: requests the bus holds at once
     (queued or in flight) across everyone, by count and by estimated retained
     bytes (payload, names, capability lists and per-item overhead). `max_pending_per_principal` /
@@ -198,7 +204,9 @@ Session flow:
    `accepted {id}` or `fail {id, ...}`. Targets publish with
    `emit {event, payload}`; subscribers receive `event {target, event, payload}`.
 6. `list_targets {id}` returns `targets {id, targets}`. `ping {nonce}` returns
-   `pong {nonce}`.
+   `pong {nonce}`, in both directions: the bus pings every connection on its
+   keepalive interval and a client must answer (or send anything else) within
+   the keepalive timeout to stay connected.
 
 Error codes: `protocol`, `unauthorized`, `forbidden`, `invalid`, `name_taken`,
 `unknown_action`, `queue_full`, `rate_limited`, `rejected`, `expired`,
@@ -248,6 +256,10 @@ retries in-flight requests according to their retry policy).
 On the client, each stream buffers up to 256 unread items. If the receiver falls
 further behind, the stream ends with an `overloaded` error instead of stalling
 the connection, and later items for it are discarded.
+
+The client and the target also ping the bus every 15 seconds and treat 45
+seconds without any frame from it as a lost connection: the client fails its
+pending requests with `Disconnected`, and the target reconnects.
 
 ## Plugin hooks
 

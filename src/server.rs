@@ -325,17 +325,41 @@ async fn run_session(
     let mut active_charge = None;
     let kicked = {
         let writer = async {
-            while let Some((frame, charge)) = outbound.recv_charged().await {
-                active_charge = Some(charge);
-                if sink.send(frame).await.is_err() {
-                    return;
+            let period = Duration::from_millis(shared.limits.keepalive_interval_ms);
+            let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    item = outbound.recv_charged() => {
+                        let Some((frame, charge)) = item else {
+                            break;
+                        };
+                        active_charge = Some(charge);
+                        if sink.send(frame).await.is_err() {
+                            return;
+                        }
+                        active_charge.take();
+                    }
+                    _ = pings.tick() => {
+                        if sink.send(Frame::Ping { nonce: 0 }).await.is_err() {
+                            return;
+                        }
+                    }
                 }
-                active_charge.take();
             }
             let _ = sink.close().await;
         };
         let reader = async {
-            while let Some(item) = stream.next().await {
+            let idle = Duration::from_millis(shared.limits.keepalive_timeout_ms);
+            loop {
+                let item = match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => return,
+                    Err(_) => {
+                        tracing::info!(session, "peer silent past the keepalive timeout");
+                        return;
+                    }
+                };
                 match item {
                     Ok(frame) => {
                         if shared.bus.frame(session, frame).await.is_err() {

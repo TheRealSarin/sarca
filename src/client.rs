@@ -14,6 +14,8 @@ const OUTBOUND_BUFFER: usize = 256;
 const STREAM_BUFFER: usize = 256;
 const EVENT_BUFFER: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code:?}: {message}")]
@@ -94,8 +96,17 @@ pub(crate) fn spawn_writer(mut sink: FrameSink, closed: CancellationToken) -> mp
     tokio::spawn(async move {
         let _closed = closed.clone().drop_guard();
         let write = async {
-            while let Some(frame) = rx.recv().await {
-                sink.send(frame).await?;
+            let start = tokio::time::Instant::now() + KEEPALIVE_INTERVAL;
+            let mut pings = tokio::time::interval_at(start, KEEPALIVE_INTERVAL);
+            pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    frame = rx.recv() => match frame {
+                        Some(frame) => sink.send(frame).await?,
+                        None => break,
+                    },
+                    _ = pings.tick() => sink.send(Frame::Ping { nonce: 0 }).await?,
+                }
             }
             sink.close().await
         };
@@ -323,11 +334,16 @@ async fn read_loop(
     closed: CancellationToken,
 ) {
     let mut stream = std::pin::pin!(stream.take_until(closed.clone().cancelled_owned()));
-    while let Some(item) = stream.next().await {
-        let frame = match item {
-            Ok(frame) => frame,
-            Err(err) => {
+    loop {
+        let frame = match tokio::time::timeout(KEEPALIVE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(err))) => {
                 tracing::debug!(%err, "client read failed");
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!("bus silent past the keepalive timeout, disconnecting");
                 break;
             }
         };
@@ -406,6 +422,9 @@ async fn read_loop(
             Frame::Error { code, message } => {
                 tracing::warn!(?code, %message, "bus reported an error")
             }
+            Frame::Ping { nonce } => {
+                let _ = inner.out.try_send(Frame::Pong { nonce });
+            }
             _ => {}
         }
     }
@@ -466,6 +485,36 @@ mod regression_tests {
         let result = tokio::time::timeout(Duration::from_millis(10), client.targets()).await;
         assert!(result.is_err());
         assert!(client.inner.state().waiters.is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn silent_bus_is_treated_as_disconnected() {
+        let (out, _rx) = mpsc::channel(1);
+        let client = client(out);
+        let (events, _events_rx) = mpsc::channel(1);
+        let started = tokio::time::Instant::now();
+        read_loop(
+            Arc::downgrade(&client.inner),
+            Box::pin(futures_util::stream::pending()),
+            events,
+            client.inner.closed.clone(),
+        )
+        .await;
+        assert_eq!(started.elapsed(), KEEPALIVE_TIMEOUT);
+        assert!(!client.is_connected());
+    }
+    #[tokio::test]
+    async fn pings_from_the_bus_are_answered() {
+        let (out, mut rx) = mpsc::channel(1);
+        let client = client(out);
+        let (events, _events_rx) = mpsc::channel(1);
+        read_loop(
+            Arc::downgrade(&client.inner),
+            Box::pin(futures_util::stream::iter([Ok(Frame::Ping { nonce: 5 })])),
+            events,
+            client.inner.closed.clone(),
+        )
+        .await;
+        assert_eq!(rx.recv().await, Some(Frame::Pong { nonce: 5 }));
     }
     #[tokio::test]
     async fn disconnect_reports_error_even_with_full_stream_buffer() {

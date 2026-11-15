@@ -85,6 +85,16 @@ impl Config {
         if self.limits.default_ttl_ms == 0 || self.limits.max_ttl_ms < self.limits.default_ttl_ms {
             return invalid("limits.default_ttl_ms must be > 0 and <= limits.max_ttl_ms".into());
         }
+        if self.limits.handshake_timeout_ms == 0 {
+            return invalid("limits.handshake_timeout_ms must be at least 1".into());
+        }
+        if self.limits.keepalive_interval_ms == 0
+            || self.limits.keepalive_timeout_ms <= self.limits.keepalive_interval_ms
+        {
+            return invalid(
+                "limits.keepalive_interval_ms must be > 0 and < limits.keepalive_timeout_ms".into(),
+            );
+        }
         if self.limits.max_attempts == 0 {
             return invalid("limits.max_attempts must be at least 1".into());
         }
@@ -237,6 +247,8 @@ pub struct Limits {
     pub max_attempts: u32,
     pub max_backoff_ms: u64,
     pub handshake_timeout_ms: u64,
+    pub keepalive_interval_ms: u64,
+    pub keepalive_timeout_ms: u64,
     pub session_buffer: usize,
     pub max_pending: usize,
     pub max_pending_bytes: usize,
@@ -266,6 +278,8 @@ impl Default for Limits {
             max_attempts: 10,
             max_backoff_ms: 60_000,
             handshake_timeout_ms: 5_000,
+            keepalive_interval_ms: 15_000,
+            keepalive_timeout_ms: 45_000,
             session_buffer: 1024,
             max_pending: 100_000,
             max_pending_bytes: 256 * 1024 * 1024,
@@ -400,6 +414,9 @@ mod tests {
             "[[rules]]\nwhen_down = \"a\"\nroute_to = []\n",
             "[rate_limit]\nper_second = 0\nburst = 1\n",
             "[limits]\nmax_attempts = 0\n",
+            "[limits]\nhandshake_timeout_ms = 0\n",
+            "[limits]\nkeepalive_interval_ms = 0\n",
+            "[limits]\nkeepalive_interval_ms = 1000\nkeepalive_timeout_ms = 1000\n",
             "[limits]\nmax_pending = 0\n",
             "[limits]\nmax_targets = 10\nmax_targets_per_principal = 20\n",
             "[limits]\nmax_subscriptions_per_session = 0\n",

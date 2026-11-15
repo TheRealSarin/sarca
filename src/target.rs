@@ -8,7 +8,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{ClientError, RemoteError, open_link, spawn_writer};
+use crate::client::{ClientError, KEEPALIVE_TIMEOUT, RemoteError, open_link, spawn_writer};
 use crate::wire::{ActionSpec, Envelope, ErrorCode, Frame, Mode};
 
 #[derive(Debug, Clone)]
@@ -328,6 +328,7 @@ impl Target {
         let permits = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         let mut handlers = JoinSet::new();
         let mut registered = false;
+        let mut silent_at = Instant::now() + KEEPALIVE_TIMEOUT;
         loop {
             let frame = tokio::select! {
                 item = stream.next() => match item {
@@ -336,7 +337,12 @@ impl Target {
                 },
                 Some(_) = handlers.join_next(), if !handlers.is_empty() => continue,
                 () = closed.cancelled() => break,
+                () = tokio::time::sleep_until(silent_at) => {
+                    tracing::warn!(target = %config.name, "bus silent past the keepalive timeout");
+                    break;
+                }
             };
+            silent_at = Instant::now() + KEEPALIVE_TIMEOUT;
             match frame {
                 Frame::Registered { .. } => {
                     registered = true;

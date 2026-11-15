@@ -720,3 +720,58 @@ async fn unauthenticated_connection_cannot_buffer_a_large_frame() {
     assert_eq!(seen.last(), Some(&Frame::Pong { nonce: 9 }));
     running.stop().await;
 }
+
+fn fast_keepalive() -> Config {
+    let mut config = Config::default();
+    config.limits.keepalive_interval_ms = 50;
+    config.limits.keepalive_timeout_ms = 300;
+    config
+}
+
+#[tokio::test]
+async fn silent_peer_is_pinged_then_disconnected() {
+    let running = start(fast_keepalive(), false).await;
+    let (mut sink, mut stream) = Endpoint::parse(&running.tcp)
+        .unwrap()
+        .connect(DEFAULT_MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    sink.send(Frame::Hello {
+        client: "mute".into(),
+        token: None,
+    })
+    .await
+    .unwrap();
+    let mut pinged = false;
+    let closed = tokio::time::timeout(WAIT, async {
+        while let Some(Ok(frame)) = stream.next().await {
+            pinged |= matches!(frame, Frame::Ping { .. });
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "silent peer was never disconnected");
+    assert!(pinged);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn idle_client_and_target_survive_the_keepalive_timeout() {
+    let running = start(fast_keepalive(), false).await;
+    let target = spawn_target(TargetConfig::new(&running.tcp, "echo-1", echo_actions()));
+    let client = Client::connect(&running.tcp, None).await.unwrap();
+    wait_for_target(&client, "echo-1").await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(client.is_connected());
+    let reply = client
+        .request(
+            "echo-1",
+            "echo",
+            b"still here".to_vec(),
+            &SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, b"still here");
+    target.abort();
+    running.stop().await;
+}
